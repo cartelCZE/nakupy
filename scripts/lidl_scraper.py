@@ -406,7 +406,7 @@ class LidlScraper:
             LOGGER.info(f"Element search results (sorted by count): {sorted_results}")
         
         # Try selectors in order of specificity (smallest result count first, but > 0)
-        promising_selectors = [s for s, c in sorted(found_elements.items(), key=lambda x: x[1]) if 0 < x[1] < 500]
+        promising_selectors = [s for s, c in sorted(found_elements.items(), key=lambda x: x[1]) if 0 < c < 500]
         
         if promising_selectors:
             LOGGER.info(f"Trying {len(promising_selectors)} promising selectors: {promising_selectors[:5]}")
