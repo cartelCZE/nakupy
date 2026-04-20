@@ -27,6 +27,7 @@ V repozitáři otevřete **Settings → Secrets and variables → Actions** a vy
 3. `GMAIL_PASSWORD`: Gmail App Password
 
 > `LIDL_EMAIL` je použit jako odesílatel i jako výchozí příjemce e-mailu.
+> Obecně používejte vlastní adresu; pro požadované nasazení v tomto zadání nastavte `jachym98@gmail.com`.
 
 ## Spouštění workflow
 

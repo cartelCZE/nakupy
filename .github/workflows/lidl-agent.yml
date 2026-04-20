@@ -16,7 +16,6 @@ jobs:
       LIDL_EMAIL: ${{ secrets.LIDL_EMAIL }}
       LIDL_PASSWORD: ${{ secrets.LIDL_PASSWORD }}
       GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
-      EMAIL_RECIPIENT: jachym98@gmail.com
 
     steps:
       - name: Checkout repository
