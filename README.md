@@ -1,70 +1,46 @@
-# Lidl Agent pro automatizaci nákupních doporučení
+# Lidl Agent pro GitHub Actions
 
-Tento repozitář obsahuje GitHub Actions agenta, který:
+Automatizace pro Lidl.cz:
 
-- přihlásí Lidl účet,
-- načte nákupní historii,
-- stáhne aktuální leták,
-- vybere relevantní produkty podle historie,
-- každou sobotu odešle HTML e-mail s doporučeními.
+1. Přihlášení do účtu.
+2. Načtení nákupní historie.
+3. Stažení aktuálního letáku.
+4. Vyhodnocení nejčastěji nakupovaných kategorií a produktů.
+5. Odeslání doporučení e-mailem.
 
-## Povinné soubory
-
-- `.github/workflows/lidl-agent.yml`
-- `scripts/lidl_agent.py`
-- `scripts/lidl_scraper.py`
-- `scripts/email_sender.py`
-- `scripts/history_analyzer.py`
-- `requirements.txt`
-- `.env.example`
+Workflow běží každou sobotu v 09:00 UTC a lze ho spustit i ručně.
 
 ## Nastavení GitHub Secrets
 
-V repozitáři otevřete **Settings → Secrets and variables → Actions** a vytvořte:
+V repozitáři otevřete `Settings -> Secrets and variables -> Actions` a nastavte:
 
-1. `LIDL_EMAIL`: `jachym98@gmail.com`
-2. `LIDL_PASSWORD`: vaše Lidl heslo
-3. `GMAIL_PASSWORD`: Gmail App Password
+- `LIDL_EMAIL`: `jachym98@gmail.com`
+- `LIDL_PASSWORD`: vaše Lidl heslo
+- `GMAIL_PASSWORD`: App password pro Gmail (https://myaccount.google.com/apppasswords)
 
-> `LIDL_EMAIL` je použit jako odesílatel i jako výchozí příjemce e-mailu.
-> Obecně používejte vlastní adresu; pro požadované nasazení v tomto zadání nastavte `jachym98@gmail.com`.
+## Ruční spuštění workflow
 
-## Spouštění workflow
-
-Workflow **Lidl Agent** se spouští:
-
-- automaticky každou sobotu v 09:00 UTC (`0 9 * * 6`),
-- ručně přes **Actions → Lidl Agent → Run workflow**.
+1. Otevřete záložku `Actions`.
+2. Vyberte workflow `Lidl Agent`.
+3. Klikněte na `Run workflow`.
 
 ## Lokální spuštění
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+.venv\Scripts\activate
 pip install -r requirements.txt
-playwright install chromium
-cp .env.example .env
+copy .env.example .env
 python scripts/lidl_agent.py
 ```
 
-## Jak to funguje
+## Troubleshooting
 
-1. `scripts/lidl_scraper.py`:
-   - přihlášení přes Playwright,
-   - načtení účtenek a letáku,
-   - parsování dat přes BeautifulSoup.
-2. `scripts/history_analyzer.py`:
-   - analýza nejčastějších produktů/kategorií v pandas,
-   - scoring doporučení podle shody, ceny, slevy a dostupnosti.
-3. `scripts/email_sender.py`:
-   - generování HTML e-mailu,
-   - odeslání přes SMTP (Gmail).
-4. `scripts/lidl_agent.py`:
-   - orchestrace celého procesu,
-   - logging a error handling.
-
-## Poznámky k bezpečnosti
-
-- Hesla nejsou ukládána v kódu.
-- Citlivé údaje se načítají z GitHub Secrets / `.env`.
-- Do repozitáře nikdy neukládejte skutečná hesla.
+- Chyba přihlášení do Lidl.cz:
+   Ověřte správnost `LIDL_EMAIL` a `LIDL_PASSWORD` v Secrets nebo `.env`.
+- Chyba při odesílání e-mailu:
+   Zkontrolujte, že `GMAIL_PASSWORD` je Gmail App Password, ne běžné heslo.
+- Selenium nebo Chrome chyba v CI:
+   Restartujte workflow a zkontrolujte log kroku `Run Lidl agent`.
+- Prázdná data historie/letáku:
+   Lidl mohl změnit HTML strukturu, upravte selektory v `scripts/lidl_scraper.py`.

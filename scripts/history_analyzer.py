@@ -1,78 +1,79 @@
 from __future__ import annotations
 
-from dataclasses import asdict
-
 import pandas as pd
-
-from lidl_scraper import FlyerItem, PurchaseItem
 
 
 class HistoryAnalyzer:
-    def __init__(self, purchases: list[PurchaseItem]) -> None:
-        self.purchases = purchases
-        records = [asdict(item) for item in purchases]
-        self.df = pd.DataFrame(records)
+    def __init__(self) -> None:
+        self.df = pd.DataFrame()
 
-    def most_frequent_products(self, top_n: int = 15) -> list[str]:
+    def analyze(self, purchase_data: list[dict]) -> None:
+        self.df = pd.DataFrame(purchase_data)
         if self.df.empty:
-            return []
-        return (
-            self.df.groupby("name", as_index=False)["quantity"]
-            .sum()
-            .sort_values("quantity", ascending=False)
-            .head(top_n)["name"]
-            .tolist()
-        )
+            return
 
-    def top_categories(self, top_n: int = 8) -> list[str]:
+        if "quantity" not in self.df.columns:
+            self.df["quantity"] = 1
+        self.df["quantity"] = pd.to_numeric(self.df["quantity"], errors="coerce").fillna(1)
+        if "name" not in self.df.columns:
+            self.df["name"] = "Unknown"
+        if "category" not in self.df.columns:
+            self.df["category"] = "Ostatni"
+
+    def get_top_categories(self) -> list[str]:
         if self.df.empty:
             return []
         return (
             self.df.groupby("category", as_index=False)["quantity"]
             .sum()
             .sort_values("quantity", ascending=False)
-            .head(top_n)["category"]
+            .head(5)["category"]
+            .astype(str)
             .tolist()
         )
 
-    def recommend_from_flyer(self, flyer_items: list[FlyerItem], limit: int = 20) -> list[dict]:
-        if not flyer_items:
+    def get_top_products(self) -> list[str]:
+        if self.df.empty:
+            return []
+        return (
+            self.df.groupby("name", as_index=False)["quantity"]
+            .sum()
+            .sort_values("quantity", ascending=False)
+            .head(10)["name"]
+            .astype(str)
+            .tolist()
+        )
+
+    def match_flyer_products(self, flyer_products: list[dict]) -> list[dict]:
+        if not flyer_products:
             return []
 
-        frequent_products = {name.lower() for name in self.most_frequent_products(100)}
-        categories = {name.lower() for name in self.top_categories(100)}
+        top_categories = {cat.lower() for cat in self.get_top_categories()}
+        top_products = {prod.lower() for prod in self.get_top_products()}
+        matched: list[dict] = []
 
-        recommended: list[dict] = []
-        for item in flyer_items:
-            name_l = item.name.lower()
-            cat_l = item.category.lower()
-
-            exact_product_match = any(fp in name_l or name_l in fp for fp in frequent_products)
-            category_match = cat_l in categories
-            if not (exact_product_match or category_match):
+        for product in flyer_products:
+            name = str(product.get("name", "")).strip()
+            category = str(product.get("category", "Ostatni")).strip()
+            if not name:
                 continue
 
-            discount_pct = 0.0
-            if item.original_price and item.original_price > item.price:
-                discount_pct = round((item.original_price - item.price) / item.original_price * 100, 1)
+            name_l = name.lower()
+            category_l = category.lower()
+            product_match = any(token in name_l or name_l in token for token in top_products)
+            category_match = category_l in top_categories
+            if not product_match and not category_match:
+                continue
 
-            score = 0.0
-            score += 4.0 if exact_product_match else 0.0
-            score += 2.0 if category_match else 0.0
-            score += min(discount_pct / 10.0, 4.0)
-            score += 1.0 if item.available else -2.0
+            score = 3 if product_match else 0
+            score += 2 if category_match else 0
 
-            recommended.append(
-                {
-                    "name": item.name,
-                    "category": item.category,
-                    "price": item.price,
-                    "original_price": item.original_price,
-                    "discount_pct": discount_pct,
-                    "available": item.available,
-                    "score": round(score, 2),
-                }
-            )
+            discount = float(product.get("discount") or 0.0)
+            score += min(discount / 10, 3)
 
-        recommended.sort(key=lambda row: row["score"], reverse=True)
-        return recommended[:limit]
+            enriched = dict(product)
+            enriched["score"] = round(score, 2)
+            matched.append(enriched)
+
+        matched.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return matched
