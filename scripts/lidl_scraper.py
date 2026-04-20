@@ -45,6 +45,7 @@ class LidlScraper:
         # API endpoints discovered by reverse-engineering the Lidl Plus mobile app flow.
         self._accounts_api = "https://accounts.lidl.com"
         self._tickets_api = "https://tickets.lidlplus.com/api/v2"
+        self._mre_api = "https://www.lidl.de/mre/api/v1"
 
     def _click_first(self, selectors: list[tuple[By, str]]) -> None:
         for by, selector in selectors:
@@ -221,6 +222,104 @@ class LidlScraper:
             "App": "com.lidl.eci.lidl.plus",
             "Accept-Language": self._language,
         }
+
+    def _web_api_headers(self) -> dict[str, str]:
+        self._api_headers()
+        return {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Accept": "application/json",
+            "Accept-Language": f"{self._language},{self._language}-{self._country};q=0.9",
+            "content-type": "application/json",
+            "Cookie": f"authToken={self._api_access_token}",
+        }
+
+    def _extract_purchase_items_from_receipt_html(self, html_receipt: str, purchased_at: str) -> list[dict]:
+        if not html_receipt:
+            return []
+
+        soup = BeautifulSoup(html_receipt, "html.parser")
+        purchases: list[dict] = []
+        seen: set[tuple[str, str, float, float]] = set()
+
+        for item in soup.select("span.article"):
+            name = str(item.get("data-art-description") or "").strip()
+            if not name:
+                continue
+
+            quantity = self._safe_float(item.get("data-art-quantity")) or 1.0
+            price = self._safe_float(item.get("data-unit-price"))
+            if price is None:
+                continue
+
+            article_id = str(item.get("data-art-id") or "")
+            dedupe_key = (article_id, name, quantity, price)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            purchases.append(
+                {
+                    "name": name,
+                    "category": self._guess_category(name),
+                    "quantity": quantity,
+                    "price": price,
+                    "purchased_at": purchased_at,
+                }
+            )
+
+        return purchases
+
+    def _get_purchase_history_via_mre_api(self) -> list[dict]:
+        headers = self._web_api_headers()
+        purchases: list[dict] = []
+        page = 1
+
+        while True:
+            response = requests.get(
+                f"{self._mre_api}/tickets?country={self._country}&page={page}",
+                headers=headers,
+                timeout=60,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            tickets = payload.get("items") or payload.get("tickets") or []
+            if not tickets:
+                break
+
+            for ticket in tickets:
+                if not isinstance(ticket, dict):
+                    continue
+                ticket_id = ticket.get("id")
+                if not ticket_id:
+                    continue
+
+                detail_response = requests.get(
+                    f"{self._mre_api}/tickets/{ticket_id}?country={self._country}&languageCode={self._language}-{self._country}",
+                    headers=headers,
+                    timeout=60,
+                )
+                detail_response.raise_for_status()
+                detail_payload = detail_response.json()
+                ticket_root = detail_payload.get("ticket", detail_payload)
+                purchased_at = str(
+                    ticket_root.get("date")
+                    or ticket.get("date")
+                    or datetime.now(timezone.utc).isoformat()
+                )
+                purchases.extend(
+                    self._extract_purchase_items_from_receipt_html(
+                        str(ticket_root.get("htmlPrintedReceipt") or ""),
+                        purchased_at,
+                    )
+                )
+
+            size = int(payload.get("size") or len(tickets) or 0)
+            total_count = int(payload.get("totalCount") or 0)
+            if size <= 0 or page * size >= total_count:
+                break
+            page += 1
+
+        return purchases
 
     def _get_purchase_history_via_api(self) -> list[dict]:
         headers = self._api_headers()
@@ -507,12 +606,26 @@ class LidlScraper:
         if self._refresh_token:
             LOGGER.info("Nacitam nakupni historii pres Lidl Plus API")
             try:
+                mre_purchases = self._get_purchase_history_via_mre_api()
+                LOGGER.info("Nacteno polozek z uctenek: %s (MRE API)", len(mre_purchases))
+                if mre_purchases:
+                    return mre_purchases
+            except Exception as exc:
+                LOGGER.warning("MRE API historie selhala (%s), zkousim puvodni mobile API", exc)
+
+            try:
                 api_purchases = self._get_purchase_history_via_api()
-                LOGGER.info("Nacteno polozek z uctenek: %s (API)", len(api_purchases))
+                LOGGER.info("Nacteno polozek z uctenek: %s (mobile API)", len(api_purchases))
                 if api_purchases:
                     return api_purchases
+                if not self._is_logged_in:
+                    LOGGER.warning("API vratilo prazdny seznam a web login neni aktivni; web fallback preskakuji.")
+                    return []
             except Exception as exc:
                 LOGGER.warning("API historie selhala (%s), zkousim web fallback", exc)
+                if not self._is_logged_in:
+                    LOGGER.warning("Web fallback preskakuji, protoze neni aktivni web login relace.")
+                    return []
 
         LOGGER.info("Nacitam nakupni historii")
         self.driver.get("https://www.lidl.cz/c/moje-uctenky")
