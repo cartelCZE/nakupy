@@ -65,14 +65,17 @@ class LidlScraper:
             for by, selector in selectors:
                 try:
                     elements = self.driver.find_elements(by, selector)
+                    if elements:
+                        element = elements[0]
+                        # Try without visibility check first - headless mode may have issues
+                        try:
+                            element.click()  # Test if clickable
+                            return element, context
+                        except Exception:
+                            # If not clickable, try next selector
+                            continue
                 except Exception:
                     continue
-                for element in elements:
-                    try:
-                        if element.is_displayed() and element.is_enabled():
-                            return element, context
-                    except Exception:
-                        continue
         self.driver.switch_to.default_content()
         return None, None
 
@@ -103,16 +106,26 @@ class LidlScraper:
         return False
 
     def _click_first_any_context(self, selectors: list[tuple[By, str]]) -> bool:
-        element, context = self._find_first_interactable(selectors)
-        if element is None:
-            return False
-        if context is not None and not self._switch_context(context):
-            return False
-        try:
-            element.click()
-        except Exception:
-            self.driver.execute_script("arguments[0].click();", element)
-        return True
+        for context in self._iter_contexts():
+            if not self._switch_context(context):
+                continue
+            for by, selector in selectors:
+                try:
+                    elements = self.driver.find_elements(by, selector)
+                    if elements:
+                        element = elements[0]
+                        try:
+                            element.click()
+                        except Exception:
+                            self.driver.execute_script("arguments[0].click();", element)
+                        self.driver.switch_to.default_content()
+                        LOGGER.debug(f"Clicked element with selector: {selector} in context {context}")
+                        return True
+                except Exception as e:
+                    LOGGER.debug(f"Failed to click {selector} in context {context}: {e}")
+                    continue
+        self.driver.switch_to.default_content()
+        return False
 
     def _looks_logged_in(self) -> bool:
         self.driver.switch_to.default_content()
@@ -129,31 +142,31 @@ class LidlScraper:
         current_url = self.driver.current_url.lower()
         return "/account" in current_url or "moje-uctenky" in current_url
 
-    def _wait_for_main_form(self) -> None:
-        def form_ready(driver: webdriver.Chrome) -> bool:
-            driver.switch_to.default_content()
-            try:
-                inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='email'], input[type='password'], input[type='text'], input[type='submit'], button[type='submit']")
-                return len(inputs) >= 2
-            except Exception:
-                return False
-        
-        try:
-            self.wait.until(form_ready)
-            LOGGER.info("Main form elements detected")
-        except TimeoutException:
-            LOGGER.warning("Form elements timeout, continuing anyway")
-            raise
-
     def _open_login_form_if_needed(self) -> None:
-        clicked = self._click_first_any_context([
+        LOGGER.debug("_open_login_form_if_needed: searching for login toggle")
+        self.driver.switch_to.default_content()
+        
+        selectors = [
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
             (By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
             (By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
             (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'muj ucet')]"),
-        ])
-        LOGGER.info(f"_open_login_form_if_needed: clicked={clicked}")
+        ]
+        
+        for by, selector in selectors:
+            try:
+                btn = self.driver.find_element(by, selector)
+                LOGGER.debug(f"Found login toggle with selector: {selector}")
+                btn.click()
+                LOGGER.debug("Clicked login toggle")
+                time.sleep(2)
+                return
+            except Exception as e:
+                LOGGER.debug(f"Selector {selector} not found")
+                continue
+        
+        LOGGER.debug("No login toggle found, form may be already visible")
 
     def _fill_first(self, selectors: list[tuple[By, str]], value: str) -> bool:
         for by, selector in selectors:
