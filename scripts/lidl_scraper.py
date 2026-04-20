@@ -223,58 +223,97 @@ class LidlScraper:
         has_inputs = any(tag in page_text for tag in ['<input', 'input type'])
         LOGGER.info(f"Page contains input tags: {has_inputs}")
 
-        email_filled = self._fill_login_field([
-            (By.CSS_SELECTOR, "input[type='email']"),
-            (By.CSS_SELECTOR, "input[name='email']"),
-            (By.CSS_SELECTOR, "input[name*='email' i]"),
-            (By.CSS_SELECTOR, "input[id*='email' i]"),
-            (By.CSS_SELECTOR, "input[name='username']"),
-            (By.CSS_SELECTOR, "input[name*='user' i]"),
-            (By.CSS_SELECTOR, "input[name*='identifier' i]"),
-            (By.CSS_SELECTOR, "input[autocomplete='username']"),
-            (By.CSS_SELECTOR, "input[type='text']"),
-        ], email)
-        LOGGER.info(f"Email filled: {email_filled}")
-        if not email_filled:
-            self.driver.switch_to.default_content()
-            iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
-            LOGGER.error(f"Email field not found in {len(iframes)} iframes, trying to inspect each...")
-            for i, iframe in enumerate(iframes):
-                try:
-                    self.driver.switch_to.frame(iframe)
-                    inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
-                    LOGGER.error(f"  iframe {i}: {len(inputs)} inputs found")
-                    for inp in inputs[:5]:
-                        LOGGER.error(f"    input: type={inp.get_attribute('type')}, name={inp.get_attribute('name')}, id={inp.get_attribute('id')}")
-                except Exception as e:
-                    LOGGER.error(f"  iframe {i}: error: {e}")
-                finally:
-                    self.driver.switch_to.default_content()
+        # Try JavaScript approach for Shadow DOM
+        LOGGER.info("Attempting JavaScript injection for form filling...")
+        try:
+            # Try to find email input via JS and fill it
+            js_email = """
+            let found = false;
+            // Try to find input by various attributes
+            let selectors = [
+                'input[type="email"]',
+                'input[name="email"]', 
+                'input[name="username"]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="login" i]'
+            ];
+            for (let sel of selectors) {
+                let inp = document.querySelector(sel);
+                if (inp && inp.offsetHeight > 0) {
+                    inp.focus();
+                    inp.value = arguments[0];
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    found = true;
+                    console.log('Found email input via ' + sel);
+                    break;
+                }
+            }
+            return found;
+            """
+            email_result = self.driver.execute_script(js_email, email)
+            LOGGER.info(f"JavaScript email fill result: {email_result}")
+            
+            # Try to find password input via JS and fill it
+            js_password = """
+            let found = false;
+            let selectors = [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[placeholder*="password" i]'
+            ];
+            for (let sel of selectors) {
+                let inp = document.querySelector(sel);
+                if (inp && inp.offsetHeight > 0) {
+                    inp.focus();
+                    inp.value = arguments[0];
+                    inp.dispatchEvent(new Event('input', { bubbles: true }));
+                    inp.dispatchEvent(new Event('change', { bubbles: true }));
+                    found = true;
+                    console.log('Found password input via ' + sel);
+                    break;
+                }
+            }
+            return found;
+            """
+            password_result = self.driver.execute_script(js_password, password)
+            LOGGER.info(f"JavaScript password fill result: {password_result}")
+            
+            if email_result and password_result:
+                LOGGER.info("Form fields filled via JavaScript")
+            else:
+                # Fallback to Selenium approach
+                LOGGER.warning("JavaScript approach didn't work, falling back to Selenium")
+                email_filled = self._fill_login_field([
+                    (By.CSS_SELECTOR, "input[type='email']"),
+                    (By.CSS_SELECTOR, "input[name='email']"),
+                    (By.CSS_SELECTOR, "input[name*='email' i]"),
+                    (By.CSS_SELECTOR, "input[id*='email' i]"),
+                    (By.CSS_SELECTOR, "input[name='username']"),
+                    (By.CSS_SELECTOR, "input[name*='user' i]"),
+                    (By.CSS_SELECTOR, "input[name*='identifier' i]"),
+                    (By.CSS_SELECTOR, "input[autocomplete='username']"),
+                    (By.CSS_SELECTOR, "input[type='text']"),
+                ], email)
+                password_filled = self._fill_login_field([
+                    (By.CSS_SELECTOR, "input[type='password']"),
+                    (By.CSS_SELECTOR, "input[name='password']"),
+                    (By.CSS_SELECTOR, "input[name*='password' i]"),
+                    (By.CSS_SELECTOR, "input[id*='password' i]"),
+                    (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
+                ], password)
+                
+                if not email_filled or not password_filled:
+                    LOGGER.error(f"Fallback failed - email_filled={email_filled}, password_filled={password_filled}")
+                    raise RuntimeError(
+                        f"Nepodarilo se vyplnit prihlasovaci fieldy, email_filled={email_filled}, password_filled={password_filled}"
+                    )
+        except Exception as e:
+            LOGGER.error(f"JavaScript execution error: {e}", exc_info=True)
+            raise
 
-        password_filled = self._fill_login_field([
-            (By.CSS_SELECTOR, "input[type='password']"),
-            (By.CSS_SELECTOR, "input[name='password']"),
-            (By.CSS_SELECTOR, "input[name*='password' i]"),
-            (By.CSS_SELECTOR, "input[id*='password' i]"),
-            (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
-        ], password)
-        LOGGER.info(f"Password filled: {password_filled}")
-
-        if not email_filled or not password_filled:
-            self.driver.switch_to.default_content()
-            iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
-            LOGGER.error(f"Form fields not filled. iframe_count={len(iframes)}")
-            for i, iframe in enumerate(iframes):
-                try:
-                    src = iframe.get_attribute("src")
-                    frame_id = iframe.get_attribute("id")
-                    LOGGER.error(f"  iframe {i}: id={frame_id}, src={src}")
-                except Exception as e:
-                    LOGGER.error(f"  iframe {i}: error reading attrs: {e}")
-            raise RuntimeError(
-                f"Nepodarilo se vyplnit prihlasovaci fieldy, email_filled={email_filled}, password_filled={password_filled}, iframe_count={len(iframes)}"
-            )
-
+        # Click submit button
+        time.sleep(2)
         clicked = self._click_first_any_context([
             (By.CSS_SELECTOR, "button[type='submit']"),
             (By.CSS_SELECTOR, "input[type='submit']"),
@@ -284,10 +323,22 @@ class LidlScraper:
         ])
         LOGGER.info(f"Submit button clicked: {clicked}")
         if not clicked:
-            self.driver.switch_to.default_content()
-            page = self.driver.page_source[:2000]
-            LOGGER.error(f"Submit button not found. page_start={page}")
-            raise RuntimeError("Nepodarilo se najit tlacitko pro potvrzeni prihlaseni.")
+            # Try JS click
+            try:
+                self.driver.execute_script("""
+                let btns = document.querySelectorAll('button[type="submit"], input[type="submit"]');
+                for (let btn of btns) {
+                    if (btn.offsetHeight > 0) {
+                        btn.click();
+                        return true;
+                    }
+                }
+                return false;
+                """)
+                LOGGER.info("Submit button clicked via JavaScript")
+            except Exception as e:
+                LOGGER.error(f"Could not click submit: {e}")
+                raise RuntimeError("Nepodarilo se najit tlacitko pro potvrzeni prihlaseni.")
 
         time.sleep(5)
 
