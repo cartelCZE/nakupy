@@ -38,6 +38,111 @@ class LidlScraper:
                     self.driver.execute_script("arguments[0].click();", elements[0])
                 return
 
+    def _iter_contexts(self) -> list[int | None]:
+        contexts: list[int | None] = [None]
+        frames = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+        contexts.extend(range(len(frames)))
+        return contexts
+
+    def _switch_context(self, context: int | None) -> bool:
+        self.driver.switch_to.default_content()
+        if context is None:
+            return True
+        frames = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+        if context >= len(frames):
+            return False
+        try:
+            self.driver.switch_to.frame(frames[context])
+            return True
+        except Exception:
+            return False
+
+    def _find_first_interactable(self, selectors: list[tuple[By, str]]) -> tuple[object | None, int | None]:
+        for context in self._iter_contexts():
+            if not self._switch_context(context):
+                continue
+            for by, selector in selectors:
+                try:
+                    elements = self.driver.find_elements(by, selector)
+                except Exception:
+                    continue
+                for element in elements:
+                    try:
+                        if element.is_displayed() and element.is_enabled():
+                            return element, context
+                    except Exception:
+                        continue
+        self.driver.switch_to.default_content()
+        return None, None
+
+    def _fill_login_field(self, selectors: list[tuple[By, str]], value: str) -> bool:
+        element, context = self._find_first_interactable(selectors)
+        if element is None:
+            return False
+        if context is not None and not self._switch_context(context):
+            return False
+        try:
+            element.clear()
+        except Exception:
+            pass
+        element.send_keys(value)
+        return True
+
+    def _click_first_any_context(self, selectors: list[tuple[By, str]]) -> bool:
+        element, context = self._find_first_interactable(selectors)
+        if element is None:
+            return False
+        if context is not None and not self._switch_context(context):
+            return False
+        try:
+            element.click()
+        except Exception:
+            self.driver.execute_script("arguments[0].click();", element)
+        return True
+
+    def _looks_logged_in(self) -> bool:
+        self.driver.switch_to.default_content()
+        page_text = self.driver.page_source.lower()
+        markers = [
+            "odhlasit",
+            "logout",
+            "muj ucet",
+            "moje uctenky",
+            "profil",
+        ]
+        if any(marker in page_text for marker in markers):
+            return True
+        current_url = self.driver.current_url.lower()
+        return "/account" in current_url or "moje-uctenky" in current_url
+
+    def _wait_for_form_render(self) -> None:
+        def _form_or_iframe_present(driver: webdriver.Chrome) -> bool:
+            driver.switch_to.default_content()
+            if driver.find_elements(By.CSS_SELECTOR, "iframe, frame"):
+                return True
+            selectors = [
+                (By.CSS_SELECTOR, "input[type='email']"),
+                (By.CSS_SELECTOR, "input[type='password']"),
+                (By.CSS_SELECTOR, "input[name*='email' i]"),
+                (By.CSS_SELECTOR, "input[name*='user' i]"),
+                (By.CSS_SELECTOR, "input[name*='identifier' i]"),
+            ]
+            for by, selector in selectors:
+                if driver.find_elements(by, selector):
+                    return True
+            return False
+
+        self.wait.until(_form_or_iframe_present)
+
+    def _open_login_form_if_needed(self) -> None:
+        self._click_first_any_context([
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
+            (By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
+            (By.XPATH, "//a[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'muj ucet')]"),
+        ])
+
     def _fill_first(self, selectors: list[tuple[By, str]], value: str) -> bool:
         for by, selector in selectors:
             elements = self.driver.find_elements(by, selector)
@@ -71,32 +176,57 @@ class LidlScraper:
 
         self._click_first([
             (By.CSS_SELECTOR, "#onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(., 'Přijmout vše') or contains(., 'Accept all')]")
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept all')]")
         ])
 
-        email_filled = self._fill_first([
+        self._open_login_form_if_needed()
+
+        try:
+            self._wait_for_form_render()
+        except TimeoutException:
+            raise RuntimeError("Prihlasovaci formular Lidl se nenaetl vcas.")
+
+        email_filled = self._fill_login_field([
             (By.CSS_SELECTOR, "input[type='email']"),
             (By.CSS_SELECTOR, "input[name='email']"),
+            (By.CSS_SELECTOR, "input[name*='email' i]"),
+            (By.CSS_SELECTOR, "input[id*='email' i]"),
+            (By.CSS_SELECTOR, "input[name='username']"),
+            (By.CSS_SELECTOR, "input[name*='user' i]"),
+            (By.CSS_SELECTOR, "input[name*='identifier' i]"),
+            (By.CSS_SELECTOR, "input[autocomplete='username']"),
+            (By.CSS_SELECTOR, "input[type='text']"),
         ], email)
-        password_filled = self._fill_first([
+
+        password_filled = self._fill_login_field([
             (By.CSS_SELECTOR, "input[type='password']"),
             (By.CSS_SELECTOR, "input[name='password']"),
+            (By.CSS_SELECTOR, "input[name*='password' i]"),
+            (By.CSS_SELECTOR, "input[id*='password' i]"),
+            (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
         ], password)
 
         if not email_filled or not password_filled:
-            raise RuntimeError("Nepodarilo se najit prihlasovaci formular Lidl.")
+            self.driver.switch_to.default_content()
+            raise RuntimeError(
+                f"Nepodarilo se najit prihlasovaci formular Lidl. URL={self.driver.current_url} iframe_count={len(self.driver.find_elements(By.CSS_SELECTOR, 'iframe, frame'))}"
+            )
 
-        self._click_first([
+        clicked = self._click_first_any_context([
             (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.XPATH, "//button[contains(., 'Přihlásit') or contains(., 'Sign in')]")
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
+            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
         ])
+        if not clicked:
+            raise RuntimeError("Nepodarilo se najit tlacitko pro potvrzeni prihlaseni.")
 
         try:
-            self.wait.until(ec.url_changes("https://www.lidl.cz/c/login"))
+            self.wait.until(lambda d: self._looks_logged_in() or "error" in d.page_source.lower())
         except TimeoutException:
-            page_text = self.driver.page_source.lower()
-            if "muj ucet" not in page_text and "odhlasit" not in page_text and "logout" not in page_text:
-                raise RuntimeError("Prihlaseni do Lidl.cz selhalo.")
+            if not self._looks_logged_in():
+                raise RuntimeError("Prihlaseni do Lidl.cz selhalo (timeout po submitu).")
 
         self._is_logged_in = True
         LOGGER.info("Prihlaseni uspesne")
