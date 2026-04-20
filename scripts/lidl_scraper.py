@@ -353,7 +353,10 @@ class LidlScraper:
         LOGGER.info("Nacitam nakupni historii")
         self.driver.get("https://www.lidl.cz/c/moje-uctenky")
         self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(3)  # Extra wait for dynamic content
+        
         html = self.driver.page_source
+        LOGGER.info(f"Receipt page length: {len(html)}, contains 'uctenka': {'uctenka' in html.lower()}")
 
         soup = BeautifulSoup(html, "html.parser")
         purchases: list[dict] = []
@@ -377,8 +380,11 @@ class LidlScraper:
             )
 
         if purchases:
+            LOGGER.info("Nacteno polozek z uctenek: %s", len(purchases))
             return purchases
 
+        # Fallback: try LD+JSON structured data
+        LOGGER.debug("No purchases found in DOM, trying LD+JSON fallback")
         for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
             try:
                 data = json.loads(script.string or "{}")
@@ -414,7 +420,10 @@ class LidlScraper:
         LOGGER.info("Stahuji aktualni Lidl letak")
         self.driver.get("https://www.lidl.cz/c/letak/s10008688")
         self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(3)  # Extra wait for dynamic content
+        
         html = self.driver.page_source
+        LOGGER.info(f"Flyer page length: {len(html)}, contains 'letak': {'letak' in html.lower()}")
 
         soup = BeautifulSoup(html, "html.parser")
         products: list[dict] = []
@@ -451,12 +460,8 @@ class LidlScraper:
                 }
             )
 
-        unique: dict[str, dict] = {}
-        for product in products:
-            unique.setdefault(product["name"].lower(), product)
-        result = list(unique.values())
-        LOGGER.info("Nacteno produktu z letaku: %s", len(result))
-        return result
+        LOGGER.info(f"Nacteno produktu z letaku: {len(products)}")
+        return products
 
     def close(self) -> None:
         self.driver.quit()
