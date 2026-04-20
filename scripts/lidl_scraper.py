@@ -77,23 +77,29 @@ class LidlScraper:
         return None, None
 
     def _fill_login_field(self, selectors: list[tuple[By, str]], value: str) -> bool:
-        self.driver.switch_to.default_content()
-        for by, selector in selectors:
-            try:
-                elements = self.driver.find_elements(by, selector)
-                if elements:
-                    element = elements[0]
-                    LOGGER.debug(f"Trying to fill with selector: {selector}")
-                    try:
-                        element.clear()
-                    except Exception:
-                        pass
-                    element.send_keys(value)
-                    LOGGER.debug(f"Field filled with selector: {selector}")
-                    return True
-            except Exception as e:
-                LOGGER.debug(f"Selector {selector} failed: {e}")
+        contexts = self._iter_contexts()
+        LOGGER.debug(f"_fill_login_field: trying {len(contexts)} contexts")
+        for context in contexts:
+            if not self._switch_context(context):
                 continue
+            for by, selector in selectors:
+                try:
+                    elements = self.driver.find_elements(by, selector)
+                    if elements:
+                        element = elements[0]
+                        LOGGER.debug(f"Found field in context {context} with selector: {selector}")
+                        try:
+                            element.clear()
+                        except Exception:
+                            pass
+                        element.send_keys(value)
+                        LOGGER.debug(f"Field filled in context {context} with selector: {selector}")
+                        self.driver.switch_to.default_content()
+                        return True
+                except Exception as e:
+                    LOGGER.debug(f"Selector {selector} in context {context} failed: {e}")
+                    continue
+        self.driver.switch_to.default_content()
         return False
 
     def _click_first_any_context(self, selectors: list[tuple[By, str]]) -> bool:
@@ -216,6 +222,21 @@ class LidlScraper:
             (By.CSS_SELECTOR, "input[type='text']"),
         ], email)
         LOGGER.info(f"Email filled: {email_filled}")
+        if not email_filled:
+            self.driver.switch_to.default_content()
+            iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
+            LOGGER.error(f"Email field not found in {len(iframes)} iframes, trying to inspect each...")
+            for i, iframe in enumerate(iframes):
+                try:
+                    self.driver.switch_to.frame(iframe)
+                    inputs = self.driver.find_elements(By.CSS_SELECTOR, "input")
+                    LOGGER.error(f"  iframe {i}: {len(inputs)} inputs found")
+                    for inp in inputs[:5]:
+                        LOGGER.error(f"    input: type={inp.get_attribute('type')}, name={inp.get_attribute('name')}, id={inp.get_attribute('id')}")
+                except Exception as e:
+                    LOGGER.error(f"  iframe {i}: error: {e}")
+                finally:
+                    self.driver.switch_to.default_content()
 
         password_filled = self._fill_login_field([
             (By.CSS_SELECTOR, "input[type='password']"),
@@ -229,10 +250,16 @@ class LidlScraper:
         if not email_filled or not password_filled:
             self.driver.switch_to.default_content()
             iframes = self.driver.find_elements(By.CSS_SELECTOR, "iframe, frame")
-            page = self.driver.page_source[:3000]
-            LOGGER.error(f"Form fields not filled. URL={self.driver.current_url}, iframe_count={len(iframes)}, page_start={page}")
+            LOGGER.error(f"Form fields not filled. iframe_count={len(iframes)}")
+            for i, iframe in enumerate(iframes):
+                try:
+                    src = iframe.get_attribute("src")
+                    frame_id = iframe.get_attribute("id")
+                    LOGGER.error(f"  iframe {i}: id={frame_id}, src={src}")
+                except Exception as e:
+                    LOGGER.error(f"  iframe {i}: error reading attrs: {e}")
             raise RuntimeError(
-                f"Nepodarilo se vyplnit prihlasovaci fieldy. URL={self.driver.current_url} iframe_count={len(iframes)}"
+                f"Nepodarilo se vyplnit prihlasovaci fieldy, email_filled={email_filled}, password_filled={password_filled}, iframe_count={len(iframes)}"
             )
 
         clicked = self._click_first_any_context([
