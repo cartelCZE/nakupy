@@ -1,0 +1,48 @@
+name: Lidl Agent
+
+on:
+  schedule:
+    - cron: '0 9 * * 6'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-lidl-agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LIDL_EMAIL: ${{ secrets.LIDL_EMAIL }}
+      LIDL_PASSWORD: ${{ secrets.LIDL_PASSWORD }}
+      GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+      EMAIL_RECIPIENT: jachym98@gmail.com
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+
+      - name: Run Lidl agent
+        run: python scripts/lidl_agent.py
+
+      - name: Report failure
+        if: failure()
+        run: |
+          echo "::error::Lidl agent run failed. Check logs above for details."
+          {
+            echo "## Lidl Agent - chyba"
+            echo "Workflow skončil chybou. Zkontrolujte logy jednotlivých kroků."
+          } >> "$GITHUB_STEP_SUMMARY"
