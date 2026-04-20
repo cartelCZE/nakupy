@@ -129,30 +129,20 @@ class LidlScraper:
         current_url = self.driver.current_url.lower()
         return "/account" in current_url or "moje-uctenky" in current_url
 
-    def _wait_for_form_render(self) -> None:
-        def _form_or_iframe_present(driver: webdriver.Chrome) -> bool:
+    def _wait_for_main_form(self) -> None:
+        def form_ready(driver: webdriver.Chrome) -> bool:
             driver.switch_to.default_content()
-            if driver.find_elements(By.CSS_SELECTOR, "iframe, frame"):
-                LOGGER.debug("Form check: iframe found")
-                return True
-            selectors = [
-                (By.CSS_SELECTOR, "input[type='email']"),
-                (By.CSS_SELECTOR, "input[type='password']"),
-                (By.CSS_SELECTOR, "input[name*='email' i]"),
-                (By.CSS_SELECTOR, "input[name*='user' i]"),
-                (By.CSS_SELECTOR, "input[name*='identifier' i]"),
-            ]
-            for by, selector in selectors:
-                if driver.find_elements(by, selector):
-                    LOGGER.debug(f"Form check: selector {selector} found")
-                    return True
-            return False
-
+            try:
+                inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='email'], input[type='password'], input[type='text'], input[type='submit'], button[type='submit']")
+                return len(inputs) >= 2
+            except Exception:
+                return False
+        
         try:
-            self.wait.until(_form_or_iframe_present)
-            LOGGER.info("Form render wait succeeded")
+            self.wait.until(form_ready)
+            LOGGER.info("Main form elements detected")
         except TimeoutException:
-            LOGGER.error("Form render timeout")
+            LOGGER.warning("Form elements timeout, continuing anyway")
             raise
 
     def _open_login_form_if_needed(self) -> None:
@@ -197,7 +187,11 @@ class LidlScraper:
         self.driver.get("https://www.lidl.cz/c/login")
         LOGGER.info(f"Login page loaded, URL={self.driver.current_url}")
         
-        time.sleep(5)
+        self.driver.switch_to.default_content()
+        page_text = self.driver.page_source
+        LOGGER.info(f"Page initial length: {len(page_text)}, contains 'login': {'login' in page_text.lower()}")
+        
+        time.sleep(8)
 
         self._click_first([
             (By.CSS_SELECTOR, "#onetrust-accept-btn-handler"),
@@ -208,7 +202,13 @@ class LidlScraper:
         self._open_login_form_if_needed()
         LOGGER.info("Opened login form if needed")
 
-        time.sleep(2)
+        time.sleep(5)
+        
+        self.driver.switch_to.default_content()
+        page_text = self.driver.page_source
+        LOGGER.info(f"Page after sleep length: {len(page_text)}, contains 'login': {'login' in page_text.lower()}")
+        has_inputs = any(tag in page_text for tag in ['<input', 'input type'])
+        LOGGER.info(f"Page contains input tags: {has_inputs}")
 
         email_filled = self._fill_login_field([
             (By.CSS_SELECTOR, "input[type='email']"),
