@@ -361,105 +361,75 @@ class LidlScraper:
         soup = BeautifulSoup(html, "html.parser")
         purchases: list[dict] = []
 
-        # Try multiple selector strategies
+        # Try multiple selector strategies - focused on purchase/receipt items
         selectors = [
-            "article",
-            "li",
+            # More specific selectors
             "[class*='receipt']",
-            "[class*='item']",
-            "[class*='transaction']",
             "[class*='uctenka']",
+            "[class*='invoice']",
+            "[class*='history']",
+            "[class*='purchase']",
             "[data-testid*='receipt']",
-            ".receipt",
-            ".purchase",
-            "[class*='RideCard']",
-            "[class*='card']",
-            "tr",  # Table rows
+            "[data-testid*='invoice']",
+            "[data-testid*='purchase']",
+            "[data-testid*='transaction']",
+            "[aria-label*='receipt']",
+            "[aria-label*='transaction']",
+            # Less likely but try them
+            "article",
+            ".receipt-item",
+            ".purchase-item",
+            ".order-item",
+            "li[class*='item']",
+            "li[class*='transaction']",
+            "tr[class*='receipt']",
+            "tr[class*='order']",
         ]
         
         found_elements = {}
         for selector in selectors:
             try:
                 elements = soup.select(selector)
+                # Log all results but flag suspicious ones (>500 = likely nav)
                 if elements:
                     found_elements[selector] = len(elements)
-                    LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
+                    if len(elements) < 500:
+                        LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
+                    else:
+                        LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements [SUSPICIOUS - likely navigation]")
             except Exception as e:
                 LOGGER.debug(f"Selector '{selector}' failed: {e}")
         
         if found_elements:
-            LOGGER.info(f"Element search results: {found_elements}")
+            # Sort by count to show smallest/most specific first
+            sorted_results = sorted(found_elements.items(), key=lambda x: x[1])
+            LOGGER.info(f"Element search results (sorted by count): {sorted_results}")
         
-        # Primary: Try all standard selectors
-        for row in soup.select(", ".join(selectors)):
-            text = row.get_text(" ", strip=True)
-            if not text or len(text) < 3:
-                continue
-            
-            price = self._extract_price(text)
-            if not text or price is None:
-                continue
-            
-            name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
-            if len(name) < 2:
-                continue
-            
-            purchases.append(
-                {
-                    "name": name,
-                    "category": self._guess_category(name),
-                    "quantity": 1,
-                    "price": price,
-                    "purchased_at": datetime.now(timezone.utc).isoformat(),
-                }
-            )
-
-        if purchases:
-            LOGGER.info("Nacteno polozek z uctenek: %s (DOM selectors)", len(purchases))
-            return purchases
-
-        # Fallback: try JavaScript extraction from page data
-        LOGGER.info("No purchases found via DOM, trying JavaScript extraction...")
-        try:
-            js_code = """
-            // Try to find purchase data in various ways
-            let purchases = [];
-            
-            // Method 1: Look for receipt containers
-            let containers = document.querySelectorAll('[class*="receipt"], [class*="uctenka"], [class*="transaction"], .purchase-item, li');
-            for (let container of containers) {
-                let text = container.innerText || container.textContent || '';
-                if (text.length > 10) {
-                    purchases.push({text: text.substring(0, 200), html: container.outerHTML.substring(0, 300)});
-                }
-            }
-            return {count: purchases.length, samples: purchases.slice(0, 3)};
-            """
-            result = self.driver.execute_script(js_code)
-            LOGGER.info(f"JavaScript extraction found: {result}")
-        except Exception as e:
-            LOGGER.warning(f"JavaScript extraction failed: {e}")
-
-        # Fallback: try LD+JSON structured data
-        LOGGER.debug("No purchases found in DOM, trying LD+JSON fallback")
-        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
-            try:
-                data = json.loads(script.string or "{}")
-            except json.JSONDecodeError:
-                continue
-            objects = data if isinstance(data, list) else [data]
-            for obj in objects:
-                if obj.get("@type") != "Product":
+        # Try selectors in order of specificity (smallest result count first, but > 0)
+        promising_selectors = [s for s, c in sorted(found_elements.items(), key=lambda x: x[1]) if 0 < x[1] < 500]
+        
+        if promising_selectors:
+            LOGGER.info(f"Trying {len(promising_selectors)} promising selectors: {promising_selectors[:5]}")
+        
+        # Try each promising selector
+        for selector in promising_selectors:
+            for row in soup.select(selector):
+                text = row.get_text(" ", strip=True)
+                if not text or len(text) < 3:
                     continue
-                name = (obj.get("name") or "").strip()
-                offers = obj.get("offers") or {}
-                raw_price = offers.get("price")
-                if not name or raw_price is None:
+                
+                price = self._extract_price(text)
+                if price is None:
                     continue
-                try:
-                    price = float(str(raw_price).replace(",", "."))
-                except ValueError:
+                
+                name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
+                if len(name) < 2:
                     continue
+                
+                # Skip if looks like navigation (too short/generic or all caps)
+                if len(name) < 3 or (name.isupper() and len(name) > 15):
+                    continue
+                
                 purchases.append(
                     {
                         "name": name,
@@ -469,9 +439,67 @@ class LidlScraper:
                         "purchased_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
+            
+            if purchases:
+                LOGGER.info(f"✓ Found {len(purchases)} purchases using selector: '{selector}'")
+                LOGGER.info("Nacteno polozek z uctenek: %s (DOM selectors)", len(purchases))
+                return purchases
+
+        # No DOM selectors worked - try generic fallback
+        if not purchases:
+            LOGGER.warning("No specific purchase selectors worked, trying all <article> and <li> elements...")
+            for row in soup.select("article, li"):
+                text = row.get_text(" ", strip=True)
+                if not text or len(text) < 5:
+                    continue
+                
+                price = self._extract_price(text)
+                if price is None:
+                    continue
+                
+                # Must have price pattern to be a purchase
+                name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
+                if len(name) < 2:
+                    continue
+                
+                purchases.append(
+                    {
+                        "name": name,
+                        "category": self._guess_category(name),
+                        "quantity": 1,
+                        "price": price,
+                        "purchased_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+        
+        if purchases:
+            LOGGER.info("Nacteno polozek z uctenek: %s (fallback selectors)", len(purchases))
+            return purchases
+
+        # Fallback: Try JavaScript to find ANY elements with price info
+        LOGGER.info("No purchases found via DOM, trying JavaScript extraction...")
+        try:
+            js_code = """
+            let results = [];
+            // Find all elements containing price patterns
+            let all_elems = document.querySelectorAll('[class*="cena"], [class*="price"], [class*="cost"], [class*="uctenka"], [class*="receipt"], li, article');
+            for (let elem of all_elems) {
+                let text = (elem.innerText || elem.textContent || '').trim();
+                if (text.match(/\\d+[\\.\\,]\\d{1,2}\\s*(Kč|CZK|Kc)/i) && text.length > 3) {
+                    results.push({text: text.substring(0, 150), class: elem.className});
+                }
+            }
+            return {count: results.length, samples: results.slice(0, 5)};
+            """
+            result = self.driver.execute_script(js_code)
+            LOGGER.info(f"JavaScript extraction found {result.get('count', 0)} elements with prices")
+            for sample in result.get('samples', [])[:3]:
+                LOGGER.info(f"  Sample: {sample.get('text', '')[:80]}")
+        except Exception as e:
+            LOGGER.warning(f"JavaScript extraction failed: {e}")
 
         if not purchases:
-            LOGGER.warning(f"No purchases extracted from page - account may have empty history or page structure changed")
+            LOGGER.warning("No purchases extracted from page - account may have empty history or page structure changed")
 
         LOGGER.info("Nacteno polozek z uctenek: %s", len(purchases))
         return purchases
