@@ -200,10 +200,6 @@ class LidlScraper:
         self.driver.get("https://www.lidl.cz/c/login")
         LOGGER.info(f"Login page loaded, URL={self.driver.current_url}")
         
-        self.driver.switch_to.default_content()
-        page_text = self.driver.page_source
-        LOGGER.info(f"Page initial length: {len(page_text)}, contains 'login': {'login' in page_text.lower()}")
-        
         time.sleep(8)
 
         self._click_first([
@@ -217,128 +213,125 @@ class LidlScraper:
 
         time.sleep(5)
         
-        self.driver.switch_to.default_content()
-        page_text = self.driver.page_source
-        LOGGER.info(f"Page after sleep length: {len(page_text)}, contains 'login': {'login' in page_text.lower()}")
-        has_inputs = any(tag in page_text for tag in ['<input', 'input type'])
-        LOGGER.info(f"Page contains input tags: {has_inputs}")
-
-        # Try JavaScript approach for Shadow DOM
-        LOGGER.info("Attempting JavaScript injection for form filling...")
+        # Deep Shadow DOM injection - find ALL inputs recursively
+        LOGGER.info("Attempting deep Shadow DOM penetration...")
         try:
-            # Try to find email input via JS and fill it
-            js_email = """
-            let found = false;
-            // Try to find input by various attributes
-            let selectors = [
-                'input[type="email"]',
-                'input[name="email"]', 
-                'input[name="username"]',
-                'input[placeholder*="email" i]',
-                'input[placeholder*="login" i]'
-            ];
-            for (let sel of selectors) {
-                let inp = document.querySelector(sel);
-                if (inp && inp.offsetHeight > 0) {
-                    inp.focus();
-                    inp.value = arguments[0];
-                    inp.dispatchEvent(new Event('input', { bubbles: true }));
-                    inp.dispatchEvent(new Event('change', { bubbles: true }));
-                    found = true;
-                    console.log('Found email input via ' + sel);
-                    break;
-                }
-            }
-            return found;
-            """
-            email_result = self.driver.execute_script(js_email, email)
-            LOGGER.info(f"JavaScript email fill result: {email_result}")
-            
-            # Try to find password input via JS and fill it
-            js_password = """
-            let found = false;
-            let selectors = [
-                'input[type="password"]',
-                'input[name="password"]',
-                'input[placeholder*="password" i]'
-            ];
-            for (let sel of selectors) {
-                let inp = document.querySelector(sel);
-                if (inp && inp.offsetHeight > 0) {
-                    inp.focus();
-                    inp.value = arguments[0];
-                    inp.dispatchEvent(new Event('input', { bubbles: true }));
-                    inp.dispatchEvent(new Event('change', { bubbles: true }));
-                    found = true;
-                    console.log('Found password input via ' + sel);
-                    break;
-                }
-            }
-            return found;
-            """
-            password_result = self.driver.execute_script(js_password, password)
-            LOGGER.info(f"JavaScript password fill result: {password_result}")
-            
-            if email_result and password_result:
-                LOGGER.info("Form fields filled via JavaScript")
-            else:
-                # Fallback to Selenium approach
-                LOGGER.warning("JavaScript approach didn't work, falling back to Selenium")
-                email_filled = self._fill_login_field([
-                    (By.CSS_SELECTOR, "input[type='email']"),
-                    (By.CSS_SELECTOR, "input[name='email']"),
-                    (By.CSS_SELECTOR, "input[name*='email' i]"),
-                    (By.CSS_SELECTOR, "input[id*='email' i]"),
-                    (By.CSS_SELECTOR, "input[name='username']"),
-                    (By.CSS_SELECTOR, "input[name*='user' i]"),
-                    (By.CSS_SELECTOR, "input[name*='identifier' i]"),
-                    (By.CSS_SELECTOR, "input[autocomplete='username']"),
-                    (By.CSS_SELECTOR, "input[type='text']"),
-                ], email)
-                password_filled = self._fill_login_field([
-                    (By.CSS_SELECTOR, "input[type='password']"),
-                    (By.CSS_SELECTOR, "input[name='password']"),
-                    (By.CSS_SELECTOR, "input[name*='password' i]"),
-                    (By.CSS_SELECTOR, "input[id*='password' i]"),
-                    (By.CSS_SELECTOR, "input[autocomplete='current-password']"),
-                ], password)
+            js_deep = """
+            function findAllInputs() {
+                let inputs = [];
+                let collected = new Set();
                 
-                if not email_filled or not password_filled:
-                    LOGGER.error(f"Fallback failed - email_filled={email_filled}, password_filled={password_filled}")
-                    raise RuntimeError(
-                        f"Nepodarilo se vyplnit prihlasovaci fieldy, email_filled={email_filled}, password_filled={password_filled}"
-                    )
-        except Exception as e:
-            LOGGER.error(f"JavaScript execution error: {e}", exc_info=True)
-            raise
-
-        # Click submit button
-        time.sleep(2)
-        clicked = self._click_first_any_context([
-            (By.CSS_SELECTOR, "button[type='submit']"),
-            (By.CSS_SELECTOR, "input[type='submit']"),
-            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
-            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'prihlas')]"),
-            (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')]"),
-        ])
-        LOGGER.info(f"Submit button clicked: {clicked}")
-        if not clicked:
-            # Try JS click
-            try:
-                self.driver.execute_script("""
-                let btns = document.querySelectorAll('button[type="submit"], input[type="submit"]');
-                for (let btn of btns) {
-                    if (btn.offsetHeight > 0) {
-                        btn.click();
-                        return true;
+                function walkTree(node, depth = 0) {
+                    if (!node || collected.has(node) || depth > 10) return;
+                    collected.add(node);
+                    
+                    // Check regular children
+                    if (node.removeChild && node.children) {
+                        for (let child of node.children) {
+                            walkTree(child, depth + 1);
+                            if (child.tagName === 'INPUT') {
+                                inputs.push({
+                                    type: child.type,
+                                    name: child.name,
+                                    id: child.id,
+                                    visible: child.offsetHeight > 0,
+                                    disabled: child.disabled,
+                                    value: child.value
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Check Shadow DOM
+                    if (node.shadowRoot) {
+                        walkTree(node.shadowRoot, depth + 1);
                     }
                 }
-                return false;
-                """)
-                LOGGER.info("Submit button clicked via JavaScript")
-            except Exception as e:
-                LOGGER.error(f"Could not click submit: {e}")
-                raise RuntimeError("Nepodarilo se najit tlacitko pro potvrzeni prihlaseni.")
+                
+                walkTree(document.documentElement);
+                return inputs;
+            }
+            
+            let all_inputs = findAllInputs();
+            console.log('Found inputs:', all_inputs.length);
+            return all_inputs;
+            """
+            
+            all_inputs = self.driver.execute_script(js_deep)
+            LOGGER.info(f"Deep search found {len(all_inputs) if all_inputs else 0} total inputs: {all_inputs}")
+            
+            # Try to fill first email-like and first password-like inputs
+            if all_inputs and len(all_inputs) >= 2:
+                # Find email input
+                email_input = next((i for i, inp in enumerate(all_inputs) if inp['type'] in ['email', 'text'] and not inp['disabled']), None)
+                password_input = next((i for i, inp in enumerate(all_inputs) if inp['type'] == 'password' and not inp['disabled']), None)
+                
+                if email_input is not None and password_input is not None:
+                    js_fill = f"""
+                    let all_inputs = document.querySelectorAll('input');
+                    if (all_inputs.length > {email_input}) {{
+                        all_inputs[{email_input}].focus();
+                        all_inputs[{email_input}].value = arguments[0];
+                        all_inputs[{email_input}].dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }}
+                    if (all_inputs.length > {password_input}) {{
+                        all_inputs[{password_input}].focus();
+                        all_inputs[{password_input}].value = arguments[1];
+                        all_inputs[{password_input}].dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }}
+                    return true;
+                    """
+                    result = self.driver.execute_script(js_fill, email, password)
+                    LOGGER.info(f"Deep fill via index [{email_input}, {password_input}] result: {result}")
+                    time.sleep(2)
+                else:
+                    LOGGER.warning(f"Could not find email/password indices: email={email_input}, password={password_input}")
+        except Exception as e:
+            LOGGER.warning(f"Deep Shadow DOM approach failed: {e}")
+
+        # Last resort - try ANY visible input approach
+        LOGGER.info("Attempting last-resort 'any visible input' approach...")
+        try:
+            js_any = """
+            let inputs = Array.from(document.querySelectorAll('input'));
+            let visible_inputs = inputs.filter(i => i.offsetHeight > 0 && !i.disabled);
+            console.log('Visible inputs:', visible_inputs.length);
+            if (visible_inputs.length >= 2) {
+                visible_inputs[0].focus();
+                visible_inputs[0].value = arguments[0];
+                visible_inputs[0].dispatchEvent(new Event('input', {bubbles: true}));
+                visible_inputs[0].dispatchEvent(new Event('change', {bubbles: true}));
+                
+                visible_inputs[1].focus();
+                visible_inputs[1].value = arguments[1];
+                visible_inputs[1].dispatchEvent(new Event('input', {bubbles: true}));
+                visible_inputs[1].dispatchEvent(new Event('change', {bubbles: true}));
+                return true;
+            }
+            return false;
+            """
+            result = self.driver.execute_script(js_any, email, password)
+            LOGGER.info(f"Last-resort any-input approach result: {result}")
+        except Exception as e:
+            LOGGER.error(f"Last-resort approach failed: {e}")
+            raise RuntimeError("Nepodarilo se najit a vyplnit prihlasovaci fieldy (all methods failed)")
+
+        # Click submit
+        time.sleep(2)
+        try:
+            js_submit = """
+            let btns = Array.from(document.querySelectorAll('button, input[type="submit"]'));
+            let visible = btns.find(b => b.offsetHeight > 0 && !b.disabled && !b.hidden);
+            if (visible) {
+                visible.click();
+                return true;
+            }
+            return false;
+            """
+            result = self.driver.execute_script(js_submit)
+            LOGGER.info(f"Submit via JavaScript: {result}")
+        except Exception as e:
+            LOGGER.warning(f"Could not submit form: {e}")
 
         time.sleep(5)
 
