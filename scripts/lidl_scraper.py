@@ -361,14 +361,49 @@ class LidlScraper:
         soup = BeautifulSoup(html, "html.parser")
         purchases: list[dict] = []
 
-        for row in soup.select("article, li, [class*='receipt'], [class*='item']"):
+        # Try multiple selector strategies
+        selectors = [
+            "article",
+            "li",
+            "[class*='receipt']",
+            "[class*='item']",
+            "[class*='transaction']",
+            "[class*='uctenka']",
+            "[data-testid*='receipt']",
+            ".receipt",
+            ".purchase",
+            "[class*='RideCard']",
+            "[class*='card']",
+            "tr",  # Table rows
+        ]
+        
+        found_elements = {}
+        for selector in selectors:
+            try:
+                elements = soup.select(selector)
+                if elements:
+                    found_elements[selector] = len(elements)
+                    LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
+            except Exception as e:
+                LOGGER.debug(f"Selector '{selector}' failed: {e}")
+        
+        if found_elements:
+            LOGGER.info(f"Element search results: {found_elements}")
+        
+        # Primary: Try all standard selectors
+        for row in soup.select(", ".join(selectors)):
             text = row.get_text(" ", strip=True)
+            if not text or len(text) < 3:
+                continue
+            
             price = self._extract_price(text)
             if not text or price is None:
                 continue
+            
             name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
             if len(name) < 2:
                 continue
+            
             purchases.append(
                 {
                     "name": name,
@@ -380,8 +415,30 @@ class LidlScraper:
             )
 
         if purchases:
-            LOGGER.info("Nacteno polozek z uctenek: %s", len(purchases))
+            LOGGER.info("Nacteno polozek z uctenek: %s (DOM selectors)", len(purchases))
             return purchases
+
+        # Fallback: try JavaScript extraction from page data
+        LOGGER.info("No purchases found via DOM, trying JavaScript extraction...")
+        try:
+            js_code = """
+            // Try to find purchase data in various ways
+            let purchases = [];
+            
+            // Method 1: Look for receipt containers
+            let containers = document.querySelectorAll('[class*="receipt"], [class*="uctenka"], [class*="transaction"], .purchase-item, li');
+            for (let container of containers) {
+                let text = container.innerText || container.textContent || '';
+                if (text.length > 10) {
+                    purchases.push({text: text.substring(0, 200), html: container.outerHTML.substring(0, 300)});
+                }
+            }
+            return {count: purchases.length, samples: purchases.slice(0, 3)};
+            """
+            result = self.driver.execute_script(js_code)
+            LOGGER.info(f"JavaScript extraction found: {result}")
+        except Exception as e:
+            LOGGER.warning(f"JavaScript extraction failed: {e}")
 
         # Fallback: try LD+JSON structured data
         LOGGER.debug("No purchases found in DOM, trying LD+JSON fallback")
@@ -413,6 +470,9 @@ class LidlScraper:
                     }
                 )
 
+        if not purchases:
+            LOGGER.warning(f"No purchases extracted from page - account may have empty history or page structure changed")
+
         LOGGER.info("Nacteno polozek z uctenek: %s", len(purchases))
         return purchases
 
@@ -428,7 +488,31 @@ class LidlScraper:
         soup = BeautifulSoup(html, "html.parser")
         products: list[dict] = []
 
-        for tile in soup.select("article, [class*='product'], [class*='offer']"):
+        # Try multiple selectors
+        selectors = [
+            "article",
+            "[class*='product']",
+            "[class*='offer']",
+            "[class*='tile']",
+            "li",
+            ".product-item",
+            "[data-testid*='product']",
+        ]
+        
+        found_elements = {}
+        for selector in selectors:
+            try:
+                elements = soup.select(selector)
+                if elements:
+                    found_elements[selector] = len(elements)
+                    LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
+            except Exception:
+                pass
+        
+        if found_elements:
+            LOGGER.info(f"Flyer element search results: {found_elements}")
+
+        for tile in soup.select(", ".join(selectors)):
             text = tile.get_text(" ", strip=True)
             if len(text) < 4:
                 continue
