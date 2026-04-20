@@ -356,152 +356,118 @@ class LidlScraper:
         time.sleep(3)  # Extra wait for dynamic content
         
         html = self.driver.page_source
-        LOGGER.info(f"Receipt page length: {len(html)}, contains 'uctenka': {'uctenka' in html.lower()}")
-
+        LOGGER.info(f"Receipt page length: {len(html)}")
+        
+        # Check what's on the page
+        has_uctenka = "uctenka" in html.lower()
+        has_receipt = "receipt" in html.lower()
+        has_transakce = "transakce" in html.lower()
+        LOGGER.info(f"Page contains: 'uctenka'={has_uctenka}, 'receipt'={has_receipt}, 'transakce'={has_transakce}")
+        
+        # Count key elements
+        li_count = html.count("<li")
+        div_count = html.count("<div")
+        LOGGER.info(f"Basic HTML counts: <li>={li_count}, <div>={div_count}")
+        
         soup = BeautifulSoup(html, "html.parser")
         purchases: list[dict] = []
 
-        # Try multiple selector strategies - focused on purchase/receipt items
-        selectors = [
-            # More specific selectors
-            "[class*='receipt']",
-            "[class*='uctenka']",
-            "[class*='invoice']",
-            "[class*='history']",
-            "[class*='purchase']",
-            "[data-testid*='receipt']",
-            "[data-testid*='invoice']",
-            "[data-testid*='purchase']",
-            "[data-testid*='transaction']",
-            "[aria-label*='receipt']",
-            "[aria-label*='transaction']",
-            # Less likely but try them
-            "article",
-            ".receipt-item",
-            ".purchase-item",
-            ".order-item",
+        # Strategy: Look for ANY elements with price patterns first
+        # This will tell us WHERE purchases might be hiding
+        price_pattern = re.compile(r"\d+[\.,]\d{1,2}\s*(Kč|CZK|Kc)")
+        elements_with_prices = []
+        
+        for elem in soup.find_all(["div", "li", "article", "tr", "section"]):
+            text = elem.get_text(" ", strip=True)
+            if price_pattern.search(text) and len(text) > 10:
+                elements_with_prices.append({
+                    "tag": elem.name,
+                    "class": elem.get("class", []),
+                    "text_preview": text[:100],
+                    "price_match": price_pattern.search(text).group()
+                })
+        
+        if elements_with_prices:
+            LOGGER.info(f"Found {len(elements_with_prices)} elements containing prices")
+            for sample in elements_with_prices[:3]:
+                LOGGER.info(f"  {sample['tag']}.{'.'.join(sample['class'])}: {sample['text_preview'][:60]} ... PRICE: {sample['price_match']}")
+        else:
+            LOGGER.warning("NO elements with prices found on page! Page might not have loaded purchases.")
+            return []
+
+        # Now try targeted selectors specifically for purchase items
+        # We know purchases have prices, so focus on that
+        selectors_to_try = [
             "li[class*='item']",
-            "li[class*='transaction']",
-            "tr[class*='receipt']",
+            "li[class*='receipt']",
+            "div[class*='receipt']",
+            "div[class*='transaction']",
+            "section[class*='transaction']",
+            "article[class*='purchase']",
             "tr[class*='order']",
         ]
         
-        found_elements = {}
-        for selector in selectors:
-            try:
-                elements = soup.select(selector)
-                # Log all results but flag suspicious ones (>500 = likely nav)
-                if elements:
-                    found_elements[selector] = len(elements)
-                    if len(elements) < 500:
-                        LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
+        for selector in selectors_to_try:
+            elements = soup.select(selector)
+            if elements:
+                LOGGER.info(f"Selector '{selector}' found {len(elements)} elements")
+                
+                for elem in elements:
+                    text = elem.get_text(" ", strip=True)
+                    if not text or len(text) < 3:
+                        continue
+                    
+                    # Extract price
+                    price_match = price_pattern.search(text)
+                    if price_match:
+                        price_str = price_match.group()
+                        try:
+                            price = float(price_str.replace(",", ".").replace("Kč", "").replace("CZK", "").replace("Kc", "").strip())
+                        except ValueError:
+                            continue
                     else:
-                        LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements [SUSPICIOUS - likely navigation]")
-            except Exception as e:
-                LOGGER.debug(f"Selector '{selector}' failed: {e}")
-        
-        if found_elements:
-            # Sort by count to show smallest/most specific first
-            sorted_results = sorted(found_elements.items(), key=lambda x: x[1])
-            LOGGER.info(f"Element search results (sorted by count): {sorted_results}")
-        
-        # Try selectors in order of specificity (smallest result count first, but > 0)
-        promising_selectors = [s for s, c in sorted(found_elements.items(), key=lambda x: x[1]) if 0 < c < 500]
-        
-        if promising_selectors:
-            LOGGER.info(f"Trying {len(promising_selectors)} promising selectors: {promising_selectors[:5]}")
-        
-        # Try each promising selector
-        for selector in promising_selectors:
-            for row in soup.select(selector):
-                text = row.get_text(" ", strip=True)
-                if not text or len(text) < 3:
-                    continue
-                
-                price = self._extract_price(text)
-                if price is None:
-                    continue
-                
-                name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
-                if len(name) < 2:
-                    continue
-                
-                # Skip if looks like navigation (too short/generic or all caps)
-                if len(name) < 3 or (name.isupper() and len(name) > 15):
-                    continue
-                
-                purchases.append(
-                    {
+                        continue
+                    
+                    # Extract name by removing all prices from text
+                    name = price_pattern.sub("", text).strip()
+                    if len(name) < 2 or len(name) > 300:
+                        continue
+                    
+                    purchases.append({
                         "name": name,
                         "category": self._guess_category(name),
                         "quantity": 1,
                         "price": price,
                         "purchased_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-            
-            if purchases:
-                LOGGER.info(f"✓ Found {len(purchases)} purchases using selector: '{selector}'")
-                LOGGER.info("Nacteno polozek z uctenek: %s (DOM selectors)", len(purchases))
-                return purchases
-
-        # No DOM selectors worked - try generic fallback
-        if not purchases:
-            LOGGER.warning("No specific purchase selectors worked, trying all <article> and <li> elements...")
-            for row in soup.select("article, li"):
-                text = row.get_text(" ", strip=True)
-                if not text or len(text) < 5:
-                    continue
+                    })
                 
-                price = self._extract_price(text)
-                if price is None:
-                    continue
-                
-                # Must have price pattern to be a purchase
-                name = re.sub(r"\s+\d+[\.,]\d{1,2}\s*(Kc|Kc\.|CZK).*", "", text, flags=re.IGNORECASE).strip(" -")
-                if len(name) < 2:
-                    continue
-                
-                purchases.append(
-                    {
-                        "name": name,
-                        "category": self._guess_category(name),
-                        "quantity": 1,
-                        "price": price,
-                        "purchased_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                )
-        
-        if purchases:
-            LOGGER.info("Nacteno polozek z uctenek: %s (fallback selectors)", len(purchases))
-            return purchases
-
-        # Fallback: Try JavaScript to find ANY elements with price info
-        LOGGER.info("No purchases found via DOM, trying JavaScript extraction...")
-        try:
-            js_code = """
-            let results = [];
-            // Find all elements containing price patterns
-            let all_elems = document.querySelectorAll('[class*="cena"], [class*="price"], [class*="cost"], [class*="uctenka"], [class*="receipt"], li, article');
-            for (let elem of all_elems) {
-                let text = (elem.innerText || elem.textContent || '').trim();
-                if (text.match(/\\d+[\\.\\,]\\d{1,2}\\s*(Kč|CZK|Kc)/i) && text.length > 3) {
-                    results.push({text: text.substring(0, 150), class: elem.className});
-                }
-            }
-            return {count: results.length, samples: results.slice(0, 5)};
-            """
-            result = self.driver.execute_script(js_code)
-            LOGGER.info(f"JavaScript extraction found {result.get('count', 0)} elements with prices")
-            for sample in result.get('samples', [])[:3]:
-                LOGGER.info(f"  Sample: {sample.get('text', '')[:80]}")
-        except Exception as e:
-            LOGGER.warning(f"JavaScript extraction failed: {e}")
+                if purchases:
+                    LOGGER.info(f"✓ Extracted {len(purchases)} purchases from selector '{selector}'")
+                    break
 
         if not purchases:
-            LOGGER.warning("No purchases extracted from page - account may have empty history or page structure changed")
+            LOGGER.warning("No purchases extracted - trying generic search with price patterns...")
+            # Last resort: find ANY text with price and try to parse it
+            for elem in soup.find_all(["li", "div", "article"]):
+                text = elem.get_text(" ", strip=True)
+                if price_pattern.search(text) and len(text) > 10 and len(text) < 500:
+                    price_match = price_pattern.search(text)
+                    if price_match:
+                        try:
+                            price = float(price_match.group().replace(",", ".").replace("Kč", "").replace("CZK", "").replace("Kc", "").strip())
+                            name = price_pattern.sub("", text).strip()[:200]
+                            if len(name) > 2:
+                                purchases.append({
+                                    "name": name,
+                                    "category": self._guess_category(name),
+                                    "quantity": 1,
+                                    "price": price,
+                                    "purchased_at": datetime.now(timezone.utc).isoformat(),
+                                })
+                        except ValueError:
+                            pass
 
-        LOGGER.info("Nacteno polozek z uctenek: %s", len(purchases))
+        LOGGER.info(f"Nacteno polozek z uctenek: {len(purchases)}")
         return purchases
 
     def get_flyer(self) -> list[dict]:
