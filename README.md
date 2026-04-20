@@ -17,6 +17,11 @@ V repozitáři otevřete `Settings -> Secrets and variables -> Actions` a nastav
 - `LIDL_EMAIL`: `jachym98@gmail.com`
 - `LIDL_PASSWORD`: vaše Lidl heslo
 - `GMAIL_PASSWORD`: App password pro Gmail (https://myaccount.google.com/apppasswords)
+- `LIDL_REFRESH_TOKEN` (doporučeno): refresh token z `lidl-plus` knihovny pro stabilní načítání účtenek přes API
+- `LIDL_COUNTRY` (volitelné): výchozí `CZ`
+- `LIDL_LANGUAGE` (volitelné): výchozí `cs`
+
+Pokud je nastaven `LIDL_REFRESH_TOKEN`, agent přeskočí křehké webové přihlášení pro historii nákupů a načte účtenky přes Lidl Plus API.
 
 ## Ruční spuštění workflow
 
@@ -43,4 +48,4 @@ python scripts/lidl_agent.py
 - Selenium nebo Chrome chyba v CI:
    Restartujte workflow a zkontrolujte log kroku `Run Lidl agent`.
 - Prázdná data historie/letáku:
-   Lidl mohl změnit HTML strukturu, upravte selektory v `scripts/lidl_scraper.py`.
+   Lidl mohl změnit HTML strukturu. Nastavte `LIDL_REFRESH_TOKEN`, aby historie účtenek šla přes API, a teprve pak laděte selektory v `scripts/lidl_scraper.py`.

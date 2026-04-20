@@ -31,17 +31,30 @@ def main() -> int:
     try:
         # Zadani pozaduje tuto adresu pro login i odeslani doporuceni.
         lidl_email = os.getenv("LIDL_EMAIL", "jachym98@gmail.com")
-        lidl_password = _required_env("LIDL_PASSWORD")
         gmail_password = _required_env("GMAIL_PASSWORD")
+        lidl_refresh_token = (os.getenv("LIDL_REFRESH_TOKEN") or "").strip()
+        lidl_country = (os.getenv("LIDL_COUNTRY") or "CZ").strip()
+        lidl_language = (os.getenv("LIDL_LANGUAGE") or "cs").strip()
+        lidl_password = os.getenv("LIDL_PASSWORD", "")
+        if not lidl_refresh_token:
+            lidl_password = _required_env("LIDL_PASSWORD")
         recipient = "jachym98@gmail.com"
 
         headless = os.getenv("HEADLESS", "true").lower() == "true"
 
         logger.info("Startuji Lidl agenta")
-        scraper = LidlScraper(headless=headless)
+        scraper = LidlScraper(
+            headless=headless,
+            refresh_token=lidl_refresh_token,
+            country=lidl_country,
+            language=lidl_language,
+        )
 
-        logger.info("Krok 1: Prihlaseni do Lidl.cz")
-        scraper.login(lidl_email, lidl_password)
+        if lidl_refresh_token:
+            logger.info("Krok 1: Preskakuji web login, pouziji Lidl Plus API token")
+        else:
+            logger.info("Krok 1: Prihlaseni do Lidl.cz")
+            scraper.login(lidl_email, lidl_password)
 
         logger.info("Krok 2: Nacteni nakupni historie")
         purchases = scraper.get_purchase_history()

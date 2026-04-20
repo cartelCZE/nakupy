@@ -5,8 +5,10 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 from bs4 import BeautifulSoup
+import requests
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.options import Options
@@ -18,7 +20,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 class LidlScraper:
-    def __init__(self, headless: bool = True) -> None:
+    def __init__(
+        self,
+        headless: bool = True,
+        refresh_token: str = "",
+        country: str = "CZ",
+        language: str = "cs",
+    ) -> None:
         options = Options()
         if headless:
             options.add_argument("--headless=new")
@@ -28,6 +36,15 @@ class LidlScraper:
         self.driver = webdriver.Chrome(options=options)
         self.wait = WebDriverWait(self.driver, 20)
         self._is_logged_in = False
+        self._refresh_token = refresh_token.strip()
+        self._api_access_token = ""
+        self._api_token_expires_at = 0.0
+        self._country = (country or "CZ").upper()
+        self._language = (language or "cs").lower()
+
+        # API endpoints discovered by reverse-engineering the Lidl Plus mobile app flow.
+        self._accounts_api = "https://accounts.lidl.com"
+        self._tickets_api = "https://tickets.lidlplus.com/api/v2"
 
     def _click_first(self, selectors: list[tuple[By, str]]) -> None:
         for by, selector in selectors:
@@ -129,18 +146,155 @@ class LidlScraper:
 
     def _looks_logged_in(self) -> bool:
         self.driver.switch_to.default_content()
+        current_url = self.driver.current_url.lower()
+        if "/login" in current_url:
+            return False
         page_text = self.driver.page_source.lower()
         markers = [
             "odhlasit",
             "logout",
             "muj ucet",
-            "moje uctenky",
             "profil",
         ]
         if any(marker in page_text for marker in markers):
             return True
-        current_url = self.driver.current_url.lower()
-        return "/account" in current_url or "moje-uctenky" in current_url
+        return "/account" in current_url
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        cleaned = (
+            text.replace("Kc", "")
+            .replace("Kc.", "")
+            .replace("Kč", "")
+            .replace("CZK", "")
+            .replace(" ", "")
+            .replace(",", ".")
+        )
+        cleaned = re.sub(r"[^0-9.\-]", "", cleaned)
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def _api_headers(self) -> dict[str, str]:
+        if not self._refresh_token:
+            raise RuntimeError("LIDL_REFRESH_TOKEN není nastaven.")
+        now = time.time()
+        if self._api_access_token and now < self._api_token_expires_at - 30:
+            return {
+                "Authorization": f"Bearer {self._api_access_token}",
+                "App-Version": "999.99.9",
+                "Operating-System": "iOs",
+                "App": "com.lidl.eci.lidl.plus",
+                "Accept-Language": self._language,
+            }
+
+        basic_secret = "TGlkbFBsdXNOYXRpdmVDbGllbnQ6c2VjcmV0"
+        token_response = requests.post(
+            f"{self._accounts_api}/connect/token",
+            headers={
+                "Authorization": f"Basic {basic_secret}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "refresh_token", "refresh_token": self._refresh_token},
+            timeout=20,
+        )
+        token_response.raise_for_status()
+        token_data = token_response.json()
+        self._api_access_token = str(token_data.get("access_token", ""))
+        expires_in = int(token_data.get("expires_in", 0) or 0)
+        self._api_token_expires_at = now + max(expires_in, 1)
+        if not self._api_access_token:
+            raise RuntimeError("Nepodařilo se získat access token z refresh tokenu.")
+
+        return {
+            "Authorization": f"Bearer {self._api_access_token}",
+            "App-Version": "999.99.9",
+            "Operating-System": "iOs",
+            "App": "com.lidl.eci.lidl.plus",
+            "Accept-Language": self._language,
+        }
+
+    def _get_purchase_history_via_api(self) -> list[dict]:
+        headers = self._api_headers()
+        url = f"{self._tickets_api}/{self._country}/tickets"
+        purchases: list[dict] = []
+
+        page_number = 1
+        total_count = 0
+        page_size = 0
+        while True:
+            response = requests.get(
+                f"{url}?pageNumber={page_number}&onlyFavorite=false",
+                headers=headers,
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            tickets = payload.get("tickets") or []
+            total_count = int(payload.get("totalCount") or 0)
+            page_size = int(payload.get("size") or 0)
+            if not tickets:
+                break
+
+            for ticket in tickets:
+                ticket_id = ticket.get("id")
+                if not ticket_id:
+                    continue
+                detail_response = requests.get(f"{url}/{ticket_id}", headers=headers, timeout=20)
+                detail_response.raise_for_status()
+                detail = detail_response.json()
+
+                line_items = []
+                for key in ["items", "articles", "positions", "products", "lineItems"]:
+                    value = detail.get(key)
+                    if isinstance(value, list):
+                        line_items = value
+                        break
+
+                if not line_items and isinstance(detail, list):
+                    line_items = detail
+
+                for item in line_items:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or item.get("title") or "").strip()
+                    if not name:
+                        continue
+                    price = self._safe_float(
+                        item.get("currentUnitPrice")
+                        or item.get("originalAmount")
+                        or item.get("price")
+                        or item.get("unitPrice")
+                    )
+                    if price is None:
+                        continue
+                    quantity = self._safe_float(item.get("quantity")) or 1.0
+
+                    purchases.append(
+                        {
+                            "name": name,
+                            "category": self._guess_category(name),
+                            "quantity": quantity,
+                            "price": price,
+                            "purchased_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                    )
+
+            if page_size <= 0:
+                break
+            if page_number * page_size >= total_count:
+                break
+            page_number += 1
+
+        return purchases
 
     def _open_login_form_if_needed(self) -> None:
         LOGGER.debug("_open_login_form_if_needed: searching for login toggle")
@@ -336,19 +490,29 @@ class LidlScraper:
         time.sleep(5)
 
         try:
-            self.wait.until(lambda d: self._looks_logged_in() or "error" in d.page_source.lower())
-            LOGGER.info("Login check passed")
+            self.wait.until(lambda d: "/login" not in d.current_url.lower())
         except TimeoutException:
-            LOGGER.warning("Login check timeout, verifying logged-in status")
-            if not self._looks_logged_in():
-                raise RuntimeError("Prihlaseni do Lidl.cz selhalo (timeout po submitu).")
+            LOGGER.warning("URL po submitu zůstala na loginu, ověřuji stav...")
+
+        if not self._looks_logged_in():
+            raise RuntimeError("Prihlaseni do Lidl.cz selhalo (nebyly nalezeny znamky prihlasene relace).")
 
         self._is_logged_in = True
         LOGGER.info("Prihlaseni uspesne")
 
     def get_purchase_history(self) -> list[dict]:
-        if not self._is_logged_in:
+        if not self._is_logged_in and not self._refresh_token:
             raise RuntimeError("Nejdrive zavolejte login(email, password).")
+
+        if self._refresh_token:
+            LOGGER.info("Nacitam nakupni historii pres Lidl Plus API")
+            try:
+                api_purchases = self._get_purchase_history_via_api()
+                LOGGER.info("Nacteno polozek z uctenek: %s (API)", len(api_purchases))
+                if api_purchases:
+                    return api_purchases
+            except Exception as exc:
+                LOGGER.warning("API historie selhala (%s), zkousim web fallback", exc)
 
         LOGGER.info("Nacitam nakupni historii")
         self.driver.get("https://www.lidl.cz/c/moje-uctenky")
@@ -482,6 +646,64 @@ class LidlScraper:
         soup = BeautifulSoup(html, "html.parser")
         products: list[dict] = []
 
+        # Runtime JS extraction first - page_source can miss data rendered after hydration.
+        try:
+            js_result = self.driver.execute_script(
+                r"""
+                const priceRegex = /\d+[\.,]\d{1,2}\s*(Kč|Kc|CZK)/i;
+                const selectors = [
+                    "[data-testid*='product']",
+                    "[class*='product']",
+                    "[class*='offer']",
+                    "article",
+                    "li",
+                    "div"
+                ];
+                const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+                const seen = new Set();
+                const rows = [];
+                for (const node of nodes) {
+                    const text = (node.innerText || "").replace(/\s+/g, " ").trim();
+                    if (!text || text.length < 6 || text.length > 260) continue;
+                    if (!priceRegex.test(text)) continue;
+                    if (seen.has(text)) continue;
+                    seen.add(text);
+                    rows.push(text);
+                    if (rows.length >= 300) break;
+                }
+                return rows;
+                """
+            )
+            if js_result:
+                for text in js_result:
+                    if not isinstance(text, str):
+                        continue
+                    name = text.split("Kč")[0].split("Kc")[0].split("CZK")[0].strip()
+                    price = self._extract_price(text)
+                    if not name or price is None:
+                        continue
+                    old_price = None
+                    all_prices = re.findall(r"(\d+[\.,]\d{1,2})\s*(Kč|Kc|Kc\.|CZK)", text, flags=re.IGNORECASE)
+                    if len(all_prices) > 1:
+                        old_price = self._safe_float(all_prices[1][0])
+                    discount_percent = 0.0
+                    if old_price and old_price > price:
+                        discount_percent = round((old_price - price) / old_price * 100, 1)
+                    products.append(
+                        {
+                            "name": name,
+                            "category": self._guess_category(name),
+                            "price": price,
+                            "original_price": old_price,
+                            "discount": discount_percent,
+                        }
+                    )
+                if products:
+                    LOGGER.info(f"Nacteno produktu z letaku: {len(products)} (runtime JS)")
+                    return products
+        except Exception as exc:
+            LOGGER.debug(f"Runtime JS extraction failed: {exc}")
+
         # Try multiple selectors
         selectors = [
             "article",
@@ -517,7 +739,7 @@ class LidlScraper:
                 continue
 
             old_price = None
-            all_prices = re.findall(r"(\d+[\.,]\d{1,2})\s*(Kc|Kc\.|CZK)", text, flags=re.IGNORECASE)
+            all_prices = re.findall(r"(\d+[\.,]\d{1,2})\s*(Kč|Kc|Kc\.|CZK)", text, flags=re.IGNORECASE)
             if len(all_prices) > 1:
                 try:
                     old_price = float(all_prices[1][0].replace(",", "."))
