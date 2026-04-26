@@ -643,6 +643,41 @@ class LidlScraper:
             deduped.append(item)
         return deduped
 
+    def _is_spotrebni_flyer(self, candidate: dict[str, Any]) -> bool:
+        name = self._normalize_text(str(candidate.get("name") or ""))
+        return "spotrebni zbozi" in name
+
+    @staticmethod
+    def _date_distance_days(first: datetime | None, second: datetime | None) -> int:
+        if not first or not second:
+            return 9999
+        return abs((first.date() - second.date()).days)
+
+    def _find_spotrebni_match_for_target(
+        self,
+        target: dict[str, Any],
+        candidates: list[dict[str, Any]],
+        used_identifiers: set[str],
+    ) -> dict[str, Any] | None:
+        spotrebni_candidates = [
+            item
+            for item in candidates
+            if self._is_spotrebni_flyer(item)
+            and str(item.get("flyer_identifier") or "")
+            and str(item.get("flyer_identifier") or "") not in used_identifiers
+        ]
+        if not spotrebni_candidates:
+            return None
+
+        target_week = str(target.get("week_scope") or "")
+        target_from = target.get("valid_from")
+
+        same_week = [item for item in spotrebni_candidates if str(item.get("week_scope") or "") == target_week]
+        pool = same_week if same_week else spotrebni_candidates
+
+        pool.sort(key=lambda item: self._date_distance_days(target_from, item.get("valid_from")))
+        return pool[0] if pool else None
+
     def _extract_products_from_viewer_flyer_payload(self, payload: dict[str, Any]) -> list[dict]:
         flyer = payload.get("flyer") if isinstance(payload, dict) else {}
         if not isinstance(flyer, dict):
@@ -1338,24 +1373,56 @@ class LidlScraper:
 
         if target_candidates:
             LOGGER.info("Nalezeno cilovych akcnich letaku (ctvrtek/pondeli): %s", len(target_candidates))
-            prioritized = target_candidates[-2:] if len(target_candidates) >= 2 else target_candidates
-            LOGGER.info("Zpracovavam posledni 2 cilove akcni letaky: %s", len(prioritized))
+            primary = target_candidates[-2:] if len(target_candidates) >= 2 else target_candidates
+            primary_ids = {str(item.get("flyer_identifier") or "") for item in primary}
+            backup = [
+                item
+                for item in target_candidates
+                if str(item.get("flyer_identifier") or "") not in primary_ids
+            ]
+            LOGGER.info("Zpracovavam posledni 2 cilove akcni letaky: %s", len(primary))
         else:
             LOGGER.warning("Cilove akcni letaky (ctvrtek/pondeli) nenalezeny, pouzivam obecny vyber")
-            prioritized = [item for item in flyer_candidates if item.get("week_scope") == "next"]
-            prioritized.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
+            primary = [item for item in flyer_candidates if item.get("week_scope") == "next"]
+            primary.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
+            backup = []
 
-        if prioritized and prioritized[0].get("week_scope") == "next":
+        if primary and primary[0].get("week_scope") == "next":
             LOGGER.info("Preferuji dalsi letak (next week)")
 
-        selected_products: list[dict] = []
-        for item in prioritized[:8]:
-            flyer_identifier = str(item.get("flyer_identifier") or "")
-            if not flyer_identifier:
-                continue
-            products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
-            if products:
-                selected_products.extend(products)
+        def collect_from(candidates: list[dict[str, Any]], all_candidates: list[dict[str, Any]], max_items: int = 8) -> list[dict]:
+            selected_products: list[dict] = []
+            used_identifiers: set[str] = set()
+            for item in candidates[:max_items]:
+                flyer_identifier = str(item.get("flyer_identifier") or "")
+                if not flyer_identifier:
+                    continue
+                used_identifiers.add(flyer_identifier)
+                products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
+                if products:
+                    selected_products.extend(products)
+                    continue
+
+                if self._is_target_akce_flyer(item):
+                    fallback_candidate = self._find_spotrebni_match_for_target(item, all_candidates, used_identifiers)
+                    if fallback_candidate:
+                        fallback_id = str(fallback_candidate.get("flyer_identifier") or "")
+                        if fallback_id:
+                            used_identifiers.add(fallback_id)
+                            LOGGER.info(
+                                "Akcni letak bez produktu, zkousim parovy spotrebni letak (%s)",
+                                fallback_id,
+                            )
+                            fallback_products = self._extract_products_from_flyer_viewer_api(fallback_id)
+                            if fallback_products:
+                                selected_products.extend(fallback_products)
+            return selected_products
+
+        selected_products = collect_from(primary, flyer_candidates)
+
+        if not selected_products and backup:
+            LOGGER.info("Primarni vyber letaku vratil 0 produktu, zkousim zbyvajici cilove letaky")
+            selected_products = collect_from(backup, flyer_candidates)
 
         if selected_products:
             merged = self._dedupe_products(selected_products)
