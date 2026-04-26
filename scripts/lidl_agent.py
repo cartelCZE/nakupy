@@ -69,6 +69,10 @@ def main() -> int:
         top_products = analyzer.get_top_products()
         recommendations = analyzer.match_flyer_products(flyer_items)
 
+        if not recommendations and flyer_items:
+            logger.info("Nenalezena shoda s historii, posilam cely letak (%s produktu)", len(flyer_items))
+            recommendations = flyer_items
+
         logger.info("Nejcastejsi kategorie: %s", ", ".join(top_categories) if top_categories else "bez dat")
         logger.info("Nejcastejsi produkty: %s", ", ".join(top_products[:5]) if top_products else "bez dat")
         logger.info("Pocet doporucenych produktu: %s", len(recommendations))
