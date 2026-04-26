@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 import requests
@@ -436,6 +438,543 @@ class LidlScraper:
             return None
         return float(match.group(1).replace(",", "."))
 
+    @staticmethod
+    def _to_absolute_url(url: str, base: str = "https://www.lidl.cz") -> str:
+        if not url:
+            return ""
+        return urljoin(base, url)
+
+    def _discover_flyer_urls(self) -> list[str]:
+        urls: list[str] = []
+        try:
+            response = requests.get("https://www.lidl.cz/c/letak", timeout=20)
+            response.raise_for_status()
+            html = response.text
+            matches = re.findall(r"https://www\\.lidl\\.cz/l/cs/letak/[^\"'\s<]+", html)
+            for raw in matches:
+                clean = raw.split("#")[0]
+                if "/view/flyer/page/" in clean or clean.endswith("/ar/0") or "/ar/0?" in clean:
+                    if clean not in urls:
+                        urls.append(clean)
+        except Exception as exc:
+            LOGGER.warning("Nepodarilo se nacist seznam letaku (%s)", exc)
+
+        try:
+            endpoint = "https://endpoints.leaflets.schwarz/v4/widgets/lidl/0627d331-5163-11ee-9b1d-fa163f6db1d0"
+            response = requests.get(endpoint, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            widget_url = (
+                payload.get("widget", {})
+                .get("attributes", {})
+                .get("url", "")
+            )
+            if isinstance(widget_url, str) and widget_url:
+                absolute = self._to_absolute_url(widget_url)
+                if absolute not in urls:
+                    urls.append(absolute)
+        except Exception as exc:
+            LOGGER.debug("Leaflets widget endpoint nedostupny (%s)", exc)
+
+        return urls
+
+    def _discover_flyer_identifiers(self) -> list[str]:
+        candidates = self._discover_flyer_candidates()
+        return [str(item.get("flyer_identifier")) for item in candidates if item.get("flyer_identifier")]
+
+    @staticmethod
+    def _parse_cz_date(value: str) -> datetime | None:
+        match = re.search(r"(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})", value or "")
+        if not match:
+            return None
+        day, month, year = match.groups()
+        try:
+            return datetime(int(year), int(month), int(day))
+        except ValueError:
+            return None
+
+    def _parse_cz_date_range(self, value: str) -> tuple[datetime | None, datetime | None]:
+        text = value or ""
+        # Example: "27. 4. - 3. 5. 2026"
+        compact_range = re.search(
+            r"(\d{1,2})\.\s*(\d{1,2})\.\s*[-–]\s*(\d{1,2})\.\s*(\d{1,2})\.\s*(\d{4})",
+            text,
+        )
+        if compact_range:
+            start_day, start_month, end_day, end_month, year = compact_range.groups()
+            try:
+                return (
+                    datetime(int(year), int(start_month), int(start_day)),
+                    datetime(int(year), int(end_month), int(end_day)),
+                )
+            except ValueError:
+                return (None, None)
+
+        full_dates = re.findall(r"\d{1,2}\.\s*\d{1,2}\.\s*\d{4}", text)
+        if len(full_dates) >= 2:
+            return (self._parse_cz_date(full_dates[0]), self._parse_cz_date(full_dates[1]))
+        if len(full_dates) == 1:
+            parsed = self._parse_cz_date(full_dates[0])
+            return (parsed, None)
+        return (None, None)
+
+    @staticmethod
+    def _monday_for(date_value: datetime) -> datetime:
+        monday = datetime(date_value.year, date_value.month, date_value.day)
+        monday = monday.replace(hour=0, minute=0, second=0, microsecond=0)
+        return monday - timedelta(days=monday.weekday())
+
+    def _resolve_week_scope_for_date(self, valid_from: datetime) -> str:
+        now_local = datetime.now()
+        current_week_start = self._monday_for(now_local)
+        next_week_start = current_week_start + timedelta(days=7)
+        next_next_week_start = next_week_start + timedelta(days=7)
+        if next_week_start <= valid_from < next_next_week_start:
+            return "next"
+        return "current"
+
+    def _discover_flyer_candidates(self) -> list[dict[str, Any]]:
+        identifiers: list[str] = []
+        candidates: list[dict[str, Any]] = []
+        sources = [
+            "https://www.lidl.cz/c/letak",
+            "https://www.lidl.cz/c/online-prospekty/s10008644",
+        ]
+
+        for source_url in sources:
+            try:
+                response = requests.get(source_url, timeout=20)
+                response.raise_for_status()
+                html = response.text
+            except Exception as exc:
+                LOGGER.debug("Nepodarilo se nacist %s (%s)", source_url, exc)
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            for anchor in soup.select("a[data-track-id]"):
+                href = str(anchor.get("href") or "")
+                flyer_id = str(anchor.get("data-track-id") or "").strip()
+                if "/letak/" in href and flyer_id and flyer_id not in identifiers:
+                    identifiers.append(flyer_id)
+
+                    title_node = anchor.select_one(".flyer__title")
+                    title_text = title_node.get_text(" ", strip=True) if title_node else ""
+                    valid_from, valid_to = self._parse_cz_date_range(title_text)
+                    week_scope = self._resolve_week_scope_for_date(valid_from) if valid_from else "unknown"
+                    candidates.append(
+                        {
+                            "flyer_identifier": flyer_id,
+                            "url": self._to_absolute_url(href),
+                            "title": title_text,
+                            "valid_from": valid_from,
+                            "valid_to": valid_to,
+                            "week_scope": week_scope,
+                        }
+                    )
+
+            patterns = [
+                r'data-track-id="([^\"]+)"',
+                r'"flyer_identifier"\s*:\s*"([^\"]+)"',
+                r'"flyerIdentifier"\s*:\s*"([^\"]+)"',
+            ]
+            for pattern in patterns:
+                for match in re.findall(pattern, html):
+                    flyer_id = str(match).strip()
+                    if flyer_id and flyer_id not in identifiers:
+                        identifiers.append(flyer_id)
+                        candidates.append(
+                            {
+                                "flyer_identifier": flyer_id,
+                                "url": "",
+                                "title": "",
+                                "valid_from": None,
+                                "valid_to": None,
+                                "week_scope": "unknown",
+                            }
+                        )
+
+        if candidates:
+            LOGGER.info("Nalezeno kandidatu na flyer_identifier: %s", len(candidates))
+        else:
+            LOGGER.warning("Na overview strance nebyl nalezen zadny flyer_identifier")
+        return candidates
+
+    def _extract_products_from_viewer_flyer_payload(self, payload: dict[str, Any]) -> list[dict]:
+        flyer = payload.get("flyer") if isinstance(payload, dict) else {}
+        if not isinstance(flyer, dict):
+            flyer = {}
+
+        products_node = flyer.get("products")
+        raw_products: list[dict[str, Any]] = []
+        if isinstance(products_node, dict):
+            raw_products = [value for value in products_node.values() if isinstance(value, dict)]
+        elif isinstance(products_node, list):
+            raw_products = [value for value in products_node if isinstance(value, dict)]
+
+        products: list[dict] = []
+        seen: set[tuple[str, float]] = set()
+
+        for item in raw_products:
+            name = str(item.get("title") or item.get("name") or "").strip()
+            price = self._safe_float(item.get("price") or item.get("currentPrice") or item.get("salePrice"))
+            if not name or price is None:
+                continue
+
+            key = (name.lower(), price)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            category_hint = str(
+                item.get("categoryPrimary")
+                or item.get("wonCategoryPrimary")
+                or item.get("category")
+                or ""
+            ).strip()
+
+            products.append(
+                {
+                    "name": name,
+                    "category": category_hint or self._guess_category(name),
+                    "price": price,
+                    "original_price": self._safe_float(item.get("regularPrice") or item.get("originalPrice")),
+                    "discount": 0.0,
+                }
+            )
+
+        return products
+
+    def _extract_products_from_flyer_viewer_api(self, flyer_identifier: str) -> list[dict]:
+        endpoint = "https://endpoints.leaflets.schwarz/v4/flyer"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Accept": "application/json",
+            "Accept-Language": f"{self._language},{self._language}-{self._country};q=0.9",
+        }
+        try:
+            response = requests.get(
+                endpoint,
+                params={"flyer_identifier": flyer_identifier},
+                headers=headers,
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            products = self._extract_products_from_viewer_flyer_payload(payload)
+            if products:
+                LOGGER.info(
+                    "Nacteno produktu z v4/flyer: %s (flyer_identifier=%s)",
+                    len(products),
+                    flyer_identifier,
+                )
+            else:
+                LOGGER.info(
+                    "v4/flyer vratil bez produktu (flyer_identifier=%s)",
+                    flyer_identifier,
+                )
+            return products
+        except Exception as exc:
+            LOGGER.warning("Volani v4/flyer selhalo pro %s (%s)", flyer_identifier, exc)
+            return []
+
+    def _extract_products_from_json_like_payload(self, payload: Any) -> list[dict]:
+        rows: list[str] = []
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                lowered_keys = {str(k).lower() for k in node.keys()}
+                # Prefer common name/title keys when present.
+                name = ""
+                for key in ["name", "title", "headline", "description", "offerTitle", "offerDescriptionShort"]:
+                    value = node.get(key)
+                    if isinstance(value, str) and value.strip():
+                        name = value.strip()
+                        break
+                price_parts: list[str] = []
+                for key in [
+                    "price",
+                    "currentPrice",
+                    "salePrice",
+                    "regularPrice",
+                    "originalPrice",
+                    "amount",
+                    "value",
+                ]:
+                    value = node.get(key)
+                    if isinstance(value, (str, int, float)):
+                        price_parts.append(str(value))
+                if name and price_parts:
+                    rows.append(f"{name} {' '.join(price_parts)} Kč")
+                elif any("price" in key or "amount" in key for key in lowered_keys):
+                    rows.append(json.dumps(node, ensure_ascii=False))
+
+                for value in node.values():
+                    walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+        return self._extract_products_from_text_rows(rows)
+
+    def _extract_products_from_leaflet_json_feed(self) -> list[dict]:
+        products: list[dict] = []
+        endpoint = "https://endpoints.leaflets.schwarz/v4/widget"
+        params = {
+            "widget_id": "0627d331-5163-11ee-9b1d-fa163f6db1d0",
+            "allow_discoverables": "true",
+            "region_id": "0",
+            "store_id": "0",
+        }
+        try:
+            response = requests.get(endpoint, params=params, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+            products.extend(self._extract_products_from_json_like_payload(payload))
+        except Exception as exc:
+            LOGGER.warning("JSON feed letaku selhal (%s)", exc)
+
+        deduped: list[dict] = []
+        seen: set[tuple[str, float]] = set()
+        for item in products:
+            name = str(item.get("name") or "").strip().lower()
+            price = self._safe_float(item.get("price"))
+            if not name or price is None:
+                continue
+            key = (name, price)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+
+        if deduped:
+            LOGGER.info("Nacteno produktu z letaku: %s (JSON feed)", len(deduped))
+        else:
+            LOGGER.info("JSON feed letaku je dostupny, ale neobsahuje primo polozky s cenami.")
+        return deduped
+
+    def _collect_leaflet_image_urls(self, flyer_url: str) -> list[str]:
+        image_urls: list[str] = []
+        self.driver.get(flyer_url)
+        self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+        time.sleep(3)
+
+        self._click_first(
+            [
+                (By.CSS_SELECTOR, "#onetrust-accept-btn-handler"),
+                (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'souhlasim') ]"),
+                (By.XPATH, "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]"),
+            ]
+        )
+
+        for _ in range(8):
+            try:
+                self.driver.execute_script("window.scrollBy(0, 800);")
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        try:
+            js_urls = self.driver.execute_script(
+                """
+                const urls = new Set();
+                document.querySelectorAll('img').forEach((img) => {
+                    const src = (img.getAttribute('src') || '').trim();
+                    if (src.includes('imgproxy.leaflets.schwarz')) urls.add(src);
+                });
+                return Array.from(urls);
+                """
+            )
+            if isinstance(js_urls, list):
+                for value in js_urls:
+                    if isinstance(value, str) and value and value not in image_urls:
+                        image_urls.append(value)
+        except Exception as exc:
+            LOGGER.debug("JS sbirani obrazku letaku selhalo (%s)", exc)
+
+        html = self.driver.page_source
+        for value in re.findall(r"https://imgproxy\\.leaflets\\.schwarz/[^\"'\s<]+", html):
+            if value not in image_urls:
+                image_urls.append(value)
+
+        high_res_urls: list[str] = []
+        for url in image_urls:
+            high = re.sub(r"/rs:fit:\d+:\d+:1/", "/rs:fit:1800:1800:1/", url)
+            high_res_urls.append(high)
+
+        return high_res_urls
+
+    def _expand_flyer_targets(self, urls: list[str]) -> list[str]:
+        targets: list[str] = []
+        for url in urls:
+            if url not in targets:
+                targets.append(url)
+            try:
+                response = requests.get(url, timeout=20)
+                response.raise_for_status()
+                html = response.text
+                matches = re.findall(r"https://www\\.lidl\\.cz/l/cs/letak/[^\"'\s<]+", html)
+                for match in matches:
+                    clean = match.split("#")[0]
+                    if clean not in targets:
+                        targets.append(clean)
+            except Exception:
+                continue
+        return targets
+
+    def _extract_products_from_text_rows(self, rows: list[str]) -> list[dict]:
+        products: list[dict] = []
+        seen: set[tuple[str, float]] = set()
+        price_pattern = re.compile(
+            r"(?<!\d)(\d{1,4}(?:[\s\u00A0]\d{3})*[\.,]\d{2}|\d{1,4}[\.,]\d)\s*(Kč|Kc|KC|CZK|K)?",
+            flags=re.IGNORECASE,
+        )
+        noise_tokens = {
+            "lidl",
+            "letak",
+            "strana",
+            "page",
+            "www",
+            "cz",
+            "od",
+            "do",
+        }
+
+        for row in rows:
+            if not isinstance(row, str):
+                continue
+            text = re.sub(r"\s+", " ", row).strip()
+            if len(text) < 6:
+                continue
+            match = price_pattern.search(text)
+            if not match:
+                continue
+            numeric = match.group(1)
+            price = self._safe_float(numeric)
+            if price is None:
+                continue
+            if price < 2 or price > 20000:
+                continue
+
+            name = text[: match.start()].strip(" -,:;")
+            if not name:
+                name = text
+            if len(name) > 140:
+                name = name[:140].strip()
+            lowered = name.lower()
+            if len(lowered) < 3:
+                continue
+            if any(token in lowered for token in noise_tokens):
+                continue
+            if re.fullmatch(r"[0-9\s\.,\-+/]+", name):
+                continue
+
+            key = (name.lower(), price)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            products.append(
+                {
+                    "name": name,
+                    "category": self._guess_category(name),
+                    "price": price,
+                    "original_price": None,
+                    "discount": 0.0,
+                }
+            )
+
+        return products
+
+    def _extract_products_via_ocr(self, image_urls: list[str]) -> list[dict]:
+        if not image_urls:
+            return []
+        try:
+            import pytesseract
+            from PIL import Image
+            from PIL import ImageOps
+            from io import BytesIO
+        except Exception as exc:
+            LOGGER.warning("OCR fallback neni dostupny (%s). Nainstalujte pillow+pytesseract a Tesseract OCR.", exc)
+            return []
+
+        tesseract_candidates = [
+            os.getenv("TESSERACT_CMD", "").strip(),
+            "tesseract",
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        tesseract_candidates = [value for value in tesseract_candidates if value]
+
+        tesseract_ready = False
+        for candidate in tesseract_candidates:
+            try:
+                pytesseract.pytesseract.tesseract_cmd = candidate
+                _ = pytesseract.get_tesseract_version()
+                tesseract_ready = True
+                break
+            except Exception:
+                continue
+
+        if not tesseract_ready:
+            LOGGER.warning("Tesseract OCR binary neni dostupny. Nastavte TESSERACT_CMD nebo PATH.")
+            return []
+
+        rows: list[str] = []
+        max_pages = min(10, len(image_urls))
+        for index, url in enumerate(image_urls[:max_pages], start=1):
+            try:
+                response = requests.get(url, timeout=30)
+                response.raise_for_status()
+                image = Image.open(BytesIO(response.content))
+                image = image.convert("L")
+                image = ImageOps.autocontrast(image)
+                image = image.resize((image.width * 2, image.height * 2))
+                text = pytesseract.image_to_string(image, config="--oem 1 --psm 6")
+                rows.extend([line for line in text.splitlines() if line.strip()])
+                LOGGER.info("OCR stranky letaku %s/%s hotovo", index, max_pages)
+            except Exception as exc:
+                LOGGER.debug("OCR selhalo pro %s (%s)", url, exc)
+
+        if not rows:
+            LOGGER.warning("OCR probehlo, ale nevratilo zadny text z obrazku letaku")
+            return []
+
+        return self._extract_products_from_text_rows(rows)
+
+    def _extract_products_from_weekly_offers_page(self) -> list[dict]:
+        try:
+            response = requests.get("https://www.lidl.cz/c/letak", timeout=20)
+            response.raise_for_status()
+            html = response.text
+        except Exception as exc:
+            LOGGER.warning("Nepodarilo se nacist textove nabidky tydne (%s)", exc)
+            return []
+
+        soup = BeautifulSoup(html, "html.parser")
+        rows: list[str] = []
+        numeric_price_pattern = re.compile(r"\d{1,4}(?:[\s\u00A0]\d{3})*[\.,]\d{1,2}")
+        for node in soup.select("a, h2, h3, p, span"):
+            text = re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            has_currency = (
+                "kč" in lowered
+                or "kc" in lowered
+                or "czk" in lowered
+                or "k�" in lowered
+            )
+            has_numeric_price = bool(numeric_price_pattern.search(text))
+            if not has_currency and not has_numeric_price:
+                continue
+            rows.append(text)
+
+        products = self._extract_products_from_text_rows(rows)
+        if products:
+            LOGGER.info("Nacteno produktu z textovych nabidek tydne: %s", len(products))
+        return products
+
     def _guess_category(self, product_name: str) -> str:
         lowered = product_name.lower()
         if any(token in lowered for token in ["mlek", "jogurt", "syr", "maslo"]):
@@ -749,132 +1288,53 @@ class LidlScraper:
 
     def get_flyer(self) -> list[dict]:
         LOGGER.info("Stahuji aktualni Lidl letak")
-        self.driver.get("https://www.lidl.cz/c/letak/s10008688")
-        self.wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-        time.sleep(3)  # Extra wait for dynamic content
-        
-        html = self.driver.page_source
-        LOGGER.info(f"Flyer page length: {len(html)}, contains 'letak': {'letak' in html.lower()}")
 
-        soup = BeautifulSoup(html, "html.parser")
+        flyer_candidates = self._discover_flyer_candidates()
+        prioritized = [item for item in flyer_candidates if item.get("week_scope") == "next"]
+        prioritized.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
+
+        if prioritized and prioritized[0].get("week_scope") == "next":
+            LOGGER.info("Preferuji dalsi letak (next week)")
+
+        for item in prioritized[:8]:
+            flyer_identifier = str(item.get("flyer_identifier") or "")
+            if not flyer_identifier:
+                continue
+            products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
+            if products:
+                return products
+
+        json_feed_products = self._extract_products_from_leaflet_json_feed()
+        if json_feed_products:
+            return json_feed_products
+
+        flyer_urls = self._discover_flyer_urls()
+        if not flyer_urls:
+            LOGGER.warning("Nepodarilo se najit aktualni URL letaku")
+            return []
+
+        flyer_urls = self._expand_flyer_targets(flyer_urls)
+
+        LOGGER.info("Nalezeno kandidatu na letak: %s", len(flyer_urls))
         products: list[dict] = []
 
-        # Runtime JS extraction first - page_source can miss data rendered after hydration.
-        try:
-            js_result = self.driver.execute_script(
-                r"""
-                const priceRegex = /\d+[\.,]\d{1,2}\s*(Kč|Kc|CZK)/i;
-                const selectors = [
-                    "[data-testid*='product']",
-                    "[class*='product']",
-                    "[class*='offer']",
-                    "article",
-                    "li",
-                    "div"
-                ];
-                const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
-                const seen = new Set();
-                const rows = [];
-                for (const node of nodes) {
-                    const text = (node.innerText || "").replace(/\s+/g, " ").trim();
-                    if (!text || text.length < 6 || text.length > 260) continue;
-                    if (!priceRegex.test(text)) continue;
-                    if (seen.has(text)) continue;
-                    seen.add(text);
-                    rows.push(text);
-                    if (rows.length >= 300) break;
-                }
-                return rows;
-                """
-            )
-            if js_result:
-                for text in js_result:
-                    if not isinstance(text, str):
-                        continue
-                    name = text.split("Kč")[0].split("Kc")[0].split("CZK")[0].strip()
-                    price = self._extract_price(text)
-                    if not name or price is None:
-                        continue
-                    old_price = None
-                    all_prices = re.findall(r"(\d+[\.,]\d{1,2})\s*(Kč|Kc|Kc\.|CZK)", text, flags=re.IGNORECASE)
-                    if len(all_prices) > 1:
-                        old_price = self._safe_float(all_prices[1][0])
-                    discount_percent = 0.0
-                    if old_price and old_price > price:
-                        discount_percent = round((old_price - price) / old_price * 100, 1)
-                    products.append(
-                        {
-                            "name": name,
-                            "category": self._guess_category(name),
-                            "price": price,
-                            "original_price": old_price,
-                            "discount": discount_percent,
-                        }
-                    )
-                if products:
-                    LOGGER.info(f"Nacteno produktu z letaku: {len(products)} (runtime JS)")
-                    return products
-        except Exception as exc:
-            LOGGER.debug(f"Runtime JS extraction failed: {exc}")
-
-        # Try multiple selectors
-        selectors = [
-            "article",
-            "[class*='product']",
-            "[class*='offer']",
-            "[class*='tile']",
-            "li",
-            ".product-item",
-            "[data-testid*='product']",
-        ]
-        
-        found_elements = {}
-        for selector in selectors:
+        for candidate in flyer_urls[:3]:
             try:
-                elements = soup.select(selector)
-                if elements:
-                    found_elements[selector] = len(elements)
-                    LOGGER.debug(f"Selector '{selector}' found {len(elements)} elements")
-            except Exception:
-                pass
-        
-        if found_elements:
-            LOGGER.info(f"Flyer element search results: {found_elements}")
+                image_urls = self._collect_leaflet_image_urls(candidate)
+                LOGGER.info("Letak %s obsahuje %s obrazku stranek", candidate, len(image_urls))
+                products = self._extract_products_via_ocr(image_urls)
+                if products:
+                    LOGGER.info("Nacteno produktu z letaku: %s (OCR)", len(products))
+                    return products
+            except Exception as exc:
+                LOGGER.warning("Zpracovani letaku selhalo pro %s (%s)", candidate, exc)
 
-        for tile in soup.select(", ".join(selectors)):
-            text = tile.get_text(" ", strip=True)
-            if len(text) < 4:
-                continue
+        products = self._extract_products_from_weekly_offers_page()
+        if products:
+            return products
 
-            name = (tile.get("aria-label") or text.split("Kc")[0].split("Kč")[0]).strip()
-            price = self._extract_price(text)
-            if not name or price is None:
-                continue
-
-            old_price = None
-            all_prices = re.findall(r"(\d+[\.,]\d{1,2})\s*(Kč|Kc|Kc\.|CZK)", text, flags=re.IGNORECASE)
-            if len(all_prices) > 1:
-                try:
-                    old_price = float(all_prices[1][0].replace(",", "."))
-                except ValueError:
-                    old_price = None
-
-            discount_percent = 0.0
-            if old_price and old_price > price:
-                discount_percent = round((old_price - price) / old_price * 100, 1)
-
-            products.append(
-                {
-                    "name": name,
-                    "category": self._guess_category(name),
-                    "price": price,
-                    "original_price": old_price,
-                    "discount": discount_percent,
-                }
-            )
-
-        LOGGER.info(f"Nacteno produktu z letaku: {len(products)}")
-        return products
+        LOGGER.warning("Z letaku se nepodarilo vytezit zadne produkty")
+        return []
 
     def close(self) -> None:
         self.driver.quit()
