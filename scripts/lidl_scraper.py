@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin
@@ -557,6 +558,8 @@ class LidlScraper:
                 if "/letak/" in href and flyer_id and flyer_id not in identifiers:
                     identifiers.append(flyer_id)
 
+                    name_node = anchor.select_one(".flyer__name")
+                    name_text = name_node.get_text(" ", strip=True) if name_node else ""
                     title_node = anchor.select_one(".flyer__title")
                     title_text = title_node.get_text(" ", strip=True) if title_node else ""
                     valid_from, valid_to = self._parse_cz_date_range(title_text)
@@ -565,6 +568,7 @@ class LidlScraper:
                         {
                             "flyer_identifier": flyer_id,
                             "url": self._to_absolute_url(href),
+                            "name": name_text,
                             "title": title_text,
                             "valid_from": valid_from,
                             "valid_to": valid_to,
@@ -586,6 +590,7 @@ class LidlScraper:
                             {
                                 "flyer_identifier": flyer_id,
                                 "url": "",
+                                "name": "",
                                 "title": "",
                                 "valid_from": None,
                                 "valid_to": None,
@@ -598,6 +603,45 @@ class LidlScraper:
         else:
             LOGGER.warning("Na overview strance nebyl nalezen zadny flyer_identifier")
         return candidates
+
+    @staticmethod
+    def _normalize_text(value: str) -> str:
+        text = unicodedata.normalize("NFKD", str(value or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        text = text.lower()
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _is_target_akce_flyer(self, candidate: dict[str, Any]) -> bool:
+        name = self._normalize_text(str(candidate.get("name") or ""))
+        if "akcni letak" not in name:
+            return False
+        return ("od pondeli" in name) or ("od ctvrtka" in name)
+
+    def _target_akce_rank(self, candidate: dict[str, Any]) -> int:
+        name = self._normalize_text(str(candidate.get("name") or ""))
+        if "od ctvrtka" in name:
+            return 0
+        if "od pondeli" in name:
+            return 1
+        return 2
+
+    @staticmethod
+    def _dedupe_products(products: list[dict]) -> list[dict]:
+        deduped: list[dict] = []
+        seen: set[tuple[str, float]] = set()
+        for item in products:
+            name = str(item.get("name") or "").strip().lower()
+            price = item.get("price")
+            price_value = float(price) if isinstance(price, (int, float)) else None
+            if not name:
+                continue
+            key = (name, price_value if price_value is not None else -1.0)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
 
     def _extract_products_from_viewer_flyer_payload(self, payload: dict[str, Any]) -> list[dict]:
         flyer = payload.get("flyer") if isinstance(payload, dict) else {}
@@ -1290,19 +1334,33 @@ class LidlScraper:
         LOGGER.info("Stahuji aktualni Lidl letak")
 
         flyer_candidates = self._discover_flyer_candidates()
-        prioritized = [item for item in flyer_candidates if item.get("week_scope") == "next"]
-        prioritized.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
+        target_candidates = [item for item in flyer_candidates if self._is_target_akce_flyer(item)]
+
+        if target_candidates:
+            LOGGER.info("Nalezeno cilovych akcnich letaku (ctvrtek/pondeli): %s", len(target_candidates))
+            prioritized = target_candidates[-2:] if len(target_candidates) >= 2 else target_candidates
+            LOGGER.info("Zpracovavam posledni 2 cilove akcni letaky: %s", len(prioritized))
+        else:
+            LOGGER.warning("Cilove akcni letaky (ctvrtek/pondeli) nenalezeny, pouzivam obecny vyber")
+            prioritized = [item for item in flyer_candidates if item.get("week_scope") == "next"]
+            prioritized.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
 
         if prioritized and prioritized[0].get("week_scope") == "next":
             LOGGER.info("Preferuji dalsi letak (next week)")
 
+        selected_products: list[dict] = []
         for item in prioritized[:8]:
             flyer_identifier = str(item.get("flyer_identifier") or "")
             if not flyer_identifier:
                 continue
             products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
             if products:
-                return products
+                selected_products.extend(products)
+
+        if selected_products:
+            merged = self._dedupe_products(selected_products)
+            LOGGER.info("Nacteno produktu ze zvolenych letaku: %s", len(merged))
+            return merged
 
         json_feed_products = self._extract_products_from_leaflet_json_feed()
         if json_feed_products:
