@@ -1369,21 +1369,46 @@ class LidlScraper:
         LOGGER.info("Stahuji aktualni Lidl letak")
 
         flyer_candidates = self._discover_flyer_candidates()
+        target_candidates = [item for item in flyer_candidates if self._is_target_akce_flyer(item)]
         selected_products: list[dict] = []
-        seen_identifiers: set[str] = set()
-        for item in flyer_candidates:
-            flyer_identifier = str(item.get("flyer_identifier") or "")
-            if not flyer_identifier or flyer_identifier in seen_identifiers:
-                continue
-            seen_identifiers.add(flyer_identifier)
-            products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
-            if products:
-                selected_products.extend(products)
+        attempted_identifiers: set[str] = set()
 
-        if selected_products:
-            merged = self._dedupe_products(selected_products)
-            LOGGER.info("Nacteno produktu ze vsech nalezenych letaku: %s", len(merged))
-            return merged
+        if target_candidates:
+            LOGGER.info("Nalezeno akcnich letaku (pondeli/ctvrtek): %s", len(target_candidates))
+            for item in target_candidates:
+                flyer_identifier = str(item.get("flyer_identifier") or "")
+                if not flyer_identifier or flyer_identifier in attempted_identifiers:
+                    continue
+                attempted_identifiers.add(flyer_identifier)
+                products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
+                if products:
+                    selected_products.extend(products)
+            if selected_products:
+                merged = self._dedupe_products(selected_products)
+                LOGGER.info("Nacteno produktu z akcnich letaku: %s", len(merged))
+                return merged
+            LOGGER.warning("Akcni letaky byly nalezeny, ale endpoint z nich nevratil produkty")
+
+        # If action flyers exist but API has no products, try OCR only on those action flyers.
+        if target_candidates:
+            ocr_products: list[dict] = []
+            for item in target_candidates:
+                action_url = str(item.get("url") or "").strip()
+                if not action_url:
+                    continue
+                try:
+                    image_urls = self._collect_leaflet_image_urls(action_url)
+                    LOGGER.info("Akcni letak %s obsahuje %s obrazku stranek", action_url, len(image_urls))
+                    extracted = self._extract_products_via_ocr(image_urls)
+                    if extracted:
+                        ocr_products.extend(extracted)
+                except Exception as exc:
+                    LOGGER.warning("OCR zpracovani akcniho letaku selhalo pro %s (%s)", action_url, exc)
+
+            if ocr_products:
+                merged = self._dedupe_products(ocr_products)
+                LOGGER.info("Nacteno produktu z akcnich letaku (OCR): %s", len(merged))
+                return merged
 
         json_feed_products = self._extract_products_from_leaflet_json_feed()
         if json_feed_products:
