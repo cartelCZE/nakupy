@@ -1369,64 +1369,20 @@ class LidlScraper:
         LOGGER.info("Stahuji aktualni Lidl letak")
 
         flyer_candidates = self._discover_flyer_candidates()
-        target_candidates = [item for item in flyer_candidates if self._is_target_akce_flyer(item)]
-
-        if target_candidates:
-            LOGGER.info("Nalezeno cilovych akcnich letaku (ctvrtek/pondeli): %s", len(target_candidates))
-            primary = target_candidates[-2:] if len(target_candidates) >= 2 else target_candidates
-            primary_ids = {str(item.get("flyer_identifier") or "") for item in primary}
-            backup = [
-                item
-                for item in target_candidates
-                if str(item.get("flyer_identifier") or "") not in primary_ids
-            ]
-            LOGGER.info("Zpracovavam posledni 2 cilove akcni letaky: %s", len(primary))
-        else:
-            LOGGER.warning("Cilove akcni letaky (ctvrtek/pondeli) nenalezeny, pouzivam obecny vyber")
-            primary = [item for item in flyer_candidates if item.get("week_scope") == "next"]
-            primary.extend(item for item in flyer_candidates if item.get("week_scope") != "next")
-            backup = []
-
-        if primary and primary[0].get("week_scope") == "next":
-            LOGGER.info("Preferuji dalsi letak (next week)")
-
-        def collect_from(candidates: list[dict[str, Any]], all_candidates: list[dict[str, Any]], max_items: int = 8) -> list[dict]:
-            selected_products: list[dict] = []
-            used_identifiers: set[str] = set()
-            for item in candidates[:max_items]:
-                flyer_identifier = str(item.get("flyer_identifier") or "")
-                if not flyer_identifier:
-                    continue
-                used_identifiers.add(flyer_identifier)
-                products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
-                if products:
-                    selected_products.extend(products)
-                    continue
-
-                if self._is_target_akce_flyer(item):
-                    fallback_candidate = self._find_spotrebni_match_for_target(item, all_candidates, used_identifiers)
-                    if fallback_candidate:
-                        fallback_id = str(fallback_candidate.get("flyer_identifier") or "")
-                        if fallback_id:
-                            used_identifiers.add(fallback_id)
-                            LOGGER.info(
-                                "Akcni letak bez produktu, zkousim parovy spotrebni letak (%s)",
-                                fallback_id,
-                            )
-                            fallback_products = self._extract_products_from_flyer_viewer_api(fallback_id)
-                            if fallback_products:
-                                selected_products.extend(fallback_products)
-            return selected_products
-
-        selected_products = collect_from(primary, flyer_candidates)
-
-        if not selected_products and backup:
-            LOGGER.info("Primarni vyber letaku vratil 0 produktu, zkousim zbyvajici cilove letaky")
-            selected_products = collect_from(backup, flyer_candidates)
+        selected_products: list[dict] = []
+        seen_identifiers: set[str] = set()
+        for item in flyer_candidates:
+            flyer_identifier = str(item.get("flyer_identifier") or "")
+            if not flyer_identifier or flyer_identifier in seen_identifiers:
+                continue
+            seen_identifiers.add(flyer_identifier)
+            products = self._extract_products_from_flyer_viewer_api(flyer_identifier)
+            if products:
+                selected_products.extend(products)
 
         if selected_products:
             merged = self._dedupe_products(selected_products)
-            LOGGER.info("Nacteno produktu ze zvolenych letaku: %s", len(merged))
+            LOGGER.info("Nacteno produktu ze vsech nalezenych letaku: %s", len(merged))
             return merged
 
         json_feed_products = self._extract_products_from_leaflet_json_feed()

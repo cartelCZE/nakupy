@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -16,6 +18,35 @@ def _required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Chybí požadovaná proměnná prostředí: {name}")
     return value
+
+
+def _default_purchase_cache_path() -> Path:
+    project_root = Path(__file__).resolve().parents[1]
+    return project_root / "data" / "purchase_history_cache.json"
+
+
+def _load_purchase_cache(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return []
+        payload = json.loads(raw)
+    except Exception:
+        return []
+
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict] = [item for item in payload if isinstance(item, dict)]
+    return rows
+
+
+def _save_purchase_cache(path: Path, purchases: list[dict]) -> None:
+    if not purchases:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(purchases, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def main() -> int:
@@ -41,6 +72,7 @@ def main() -> int:
         recipient = "jachym98@gmail.com"
 
         headless = os.getenv("HEADLESS", "true").lower() == "true"
+        cache_path = Path(os.getenv("PURCHASE_HISTORY_CACHE_PATH", "").strip() or _default_purchase_cache_path())
 
         logger.info("Startuji Lidl agenta")
         scraper = LidlScraper(
@@ -57,7 +89,15 @@ def main() -> int:
             scraper.login(lidl_email, lidl_password)
 
         logger.info("Krok 2: Nacteni nakupni historie")
-        purchases = scraper.get_purchase_history()
+        purchases = _load_purchase_cache(cache_path)
+        if purchases:
+            logger.info("Nactena historie z cache: %s (%s polozek)", cache_path, len(purchases))
+        else:
+            logger.info("Cache historie neexistuje nebo je prazdna, nacitam z Lidl")
+            purchases = scraper.get_purchase_history()
+            _save_purchase_cache(cache_path, purchases)
+            if purchases:
+                logger.info("Historie ulozena do cache: %s (%s polozek)", cache_path, len(purchases))
 
         logger.info("Krok 3: Stazeni aktualniho Lidl letaku")
         flyer_items = scraper.get_flyer()
